@@ -5,6 +5,9 @@ project(enostorg)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Skip install rules for FetchContent dependencies (avoids export-set errors)
+set(CMAKE_SKIP_INSTALL_RULES ON)
+
 # Drogon build options (applied before FetchContent)
 set(BUILD_SHARED_LIBS OFF  CACHE BOOL "Build drogon as static libraries")
 set(BUILD_CTL OFF          CACHE BOOL "Skip building drogon_ctl tool")
