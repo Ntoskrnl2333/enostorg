@@ -17,12 +17,11 @@ set(BUILD_BROTLI OFF       CACHE BOOL "Skip Brotli compression")
 include(FetchContent)
 
 # zlib: required by Drogon
-# Use native Windows path for file:// URL
-set(_zlib_tar "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zlib.tar.gz")
-string(REPLACE "\\" "/" _zlib_tar "${_zlib_tar}")
 FetchContent_Declare(
     zlib
-    URL  "file://${_zlib_tar}"
+    GIT_REPOSITORY https://github.com/madler/zlib.git
+    GIT_TAG        v1.3.1
+    GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(zlib)
 if(NOT TARGET ZLIB::ZLIB)
@@ -43,11 +42,11 @@ set(ZLIB_LIBRARIES zlibstatic CACHE INTERNAL "zlib library")
 set(ZLIB_FOUND TRUE CACHE INTERNAL "")
 
 # jsoncpp: required by Drogon
-set(_jsoncpp_tar "${CMAKE_CURRENT_SOURCE_DIR}/third_party/jsoncpp.tar.gz")
-string(REPLACE "\\" "/" _jsoncpp_tar "${_jsoncpp_tar}")
 FetchContent_Declare(
     jsoncpp
-    URL  "file://${_jsoncpp_tar}"
+    GIT_REPOSITORY https://github.com/open-source-parsers/jsoncpp.git
+    GIT_TAG        1.9.6
+    GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(jsoncpp)
 
