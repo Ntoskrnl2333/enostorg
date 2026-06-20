@@ -19,6 +19,31 @@ set(BUILD_BROTLI OFF       CACHE BOOL "Skip Brotli compression")
 
 include(FetchContent)
 
+# sqlite3: download amalgamation directly
+set(SQLITE_ARCHIVE "${CMAKE_CURRENT_BINARY_DIR}/sqlite-amalgamation.zip")
+set(SQLITE_EXTRACT_DIR "${CMAKE_CURRENT_BINARY_DIR}/sqlite3-amalgamation")
+file(DOWNLOAD
+    "https://www.sqlite.org/2025/sqlite-amalgamation-3490100.zip"
+    "${SQLITE_ARCHIVE}"
+    SHOW_PROGRESS
+)
+file(ARCHIVE_EXTRACT INPUT "${SQLITE_ARCHIVE}" DESTINATION "${SQLITE_EXTRACT_DIR}")
+
+add_library(sqlite3 STATIC
+    "${SQLITE_EXTRACT_DIR}/sqlite-amalgamation-3490100/sqlite3.c"
+)
+target_include_directories(sqlite3 PUBLIC
+    "${SQLITE_EXTRACT_DIR}/sqlite-amalgamation-3490100"
+)
+target_compile_definitions(sqlite3 PRIVATE
+    SQLITE_ENABLE_FTS5
+    SQLITE_THREADSAFE=1
+    SQLITE_OMIT_LOAD_EXTENSION
+)
+if(MSVC)
+    target_compile_definitions(sqlite3 PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 # zlib: required by Drogon
 FetchContent_Declare(
     zlib
@@ -74,6 +99,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(drogon)
 
-add_executable(${PROJECT_NAME} main.cpp)
+add_executable(${PROJECT_NAME} main.cpp FileTable.cpp)
 
-target_link_libraries(${PROJECT_NAME} PRIVATE drogon)
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /utf-8)
+endif()
+
+target_link_libraries(${PROJECT_NAME} PRIVATE drogon sqlite3)
