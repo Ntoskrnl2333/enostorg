@@ -58,14 +58,18 @@ FileTable& FileTable::operator=(FileTable&& other) noexcept {
 // ============================================================================
 
 void FileTable::initSchema() {
+    // Enable foreign key enforcement
+    execute("PRAGMA foreign_keys = ON");
+
     const char* createFilesTable = R"(
         CREATE TABLE IF NOT EXISTS files (
             file_path    TEXT PRIMARY KEY NOT NULL,
-            create_time  INTEGER NOT NULL,
-            modify_time  INTEGER NOT NULL,
-            size         INTEGER NOT NULL,
+            create_time  DATETIME NOT NULL,
+            modify_time  DATETIME NOT NULL,
+            size         BIGINT NOT NULL,
             description  TEXT,
-            start_block  INTEGER
+            start_block  BIGINT,
+            FOREIGN KEY (start_block) REFERENCES blocks(id)
         )
     )";
 
@@ -73,10 +77,10 @@ void FileTable::initSchema() {
         CREATE TABLE IF NOT EXISTS blocks (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             block_path    TEXT NOT NULL,
-            next_block    INTEGER,
-            spare_block   INTEGER,
-            is_bad        INTEGER NOT NULL DEFAULT 0,
-            block_size    INTEGER NOT NULL,
+            next_block    BIGINT,
+            spare_block   BIGINT,
+            is_bad        BOOLEAN NOT NULL DEFAULT 0,
+            block_size    BIGINT NOT NULL,
             sha256        TEXT NOT NULL
         )
     )";
