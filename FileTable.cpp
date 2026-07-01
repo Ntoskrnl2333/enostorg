@@ -13,9 +13,10 @@ namespace enostorg {
 // ============================================================================
 
 FileEntry::FileEntry(const std::string& path, std::time_t ctime, std::time_t mtime,
-                     uint64_t sz, const std::string& desc, int64_t startBlock)
+                     uint64_t sz, const std::string& desc, int64_t startBlock,
+                     double activity)
     : filePath(path), createTime(ctime), modifyTime(mtime), size(sz),
-      description(desc), startBlockId(startBlock) {}
+      description(desc), startBlockId(startBlock), accessActivity(activity) {}
 
 BlockEntry::BlockEntry(const std::string& path, int64_t next, int64_t spare,
                        bool bad, uint64_t sz, const std::string& hash)
@@ -63,12 +64,13 @@ void FileTable::initSchema() {
 
     const char* createFilesTable = R"(
         CREATE TABLE IF NOT EXISTS files (
-            file_path    TEXT PRIMARY KEY NOT NULL,
-            create_time  DATETIME NOT NULL,
-            modify_time  DATETIME NOT NULL,
-            size         BIGINT NOT NULL,
-            description  TEXT,
-            start_block  BIGINT,
+            file_path        TEXT PRIMARY KEY NOT NULL,
+            create_time      DATETIME NOT NULL,
+            modify_time      DATETIME NOT NULL,
+            size             BIGINT NOT NULL,
+            description      TEXT,
+            start_block      BIGINT,
+            access_activity  REAL NOT NULL DEFAULT 0.0,
             FOREIGN KEY (start_block) REFERENCES blocks(id)
         )
     )";
@@ -121,6 +123,7 @@ void FileTable::bindFileEntry(sqlite3_stmt* stmt, const FileEntry& file) const {
     } else {
         sqlite3_bind_null(stmt, 6);
     }
+    sqlite3_bind_double(stmt, 7, file.accessActivity);
 }
 
 FileEntry FileTable::extractFileEntry(sqlite3_stmt* stmt) const {
@@ -134,6 +137,7 @@ FileEntry FileTable::extractFileEntry(sqlite3_stmt* stmt) const {
     entry.startBlockId = sqlite3_column_type(stmt, 5) == SQLITE_NULL
                              ? -1
                              : sqlite3_column_int64(stmt, 5);
+    entry.accessActivity = sqlite3_column_double(stmt, 6);
     return entry;
 }
 
@@ -161,8 +165,8 @@ BlockEntry FileTable::extractBlockEntry(sqlite3_stmt* stmt) const {
 
 bool FileTable::insertFile(const FileEntry& file) {
     const char* sql = R"(
-        INSERT INTO files (file_path, create_time, modify_time, size, description, start_block)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO files (file_path, create_time, modify_time, size, description, start_block, access_activity)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (!prepareStatement(sql, &stmt)) return false;
@@ -200,7 +204,7 @@ bool FileTable::deleteFile(const std::string& filePath) {
 bool FileTable::updateFile(const FileEntry& file) {
     const char* sql = R"(
         UPDATE files SET create_time = ?, modify_time = ?, size = ?,
-                         description = ?, start_block = ?
+                         description = ?, start_block = ?, access_activity = ?
         WHERE file_path = ?
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -215,7 +219,8 @@ bool FileTable::updateFile(const FileEntry& file) {
     } else {
         sqlite3_bind_null(stmt, 5);
     }
-    sqlite3_bind_text(stmt, 6, file.filePath.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 6, file.accessActivity);
+    sqlite3_bind_text(stmt, 7, file.filePath.c_str(), -1, SQLITE_TRANSIENT);
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);

@@ -19,10 +19,12 @@ struct FileEntry {
     uint64_t size;
     std::string description;
     int64_t startBlockId;
+    double accessActivity;
 
-    FileEntry() = default;
+    FileEntry() : accessActivity(0.0) {}
     FileEntry(const std::string& path, std::time_t ctime, std::time_t mtime,
-              uint64_t sz, const std::string& desc, int64_t startBlock = -1);
+              uint64_t sz, const std::string& desc, int64_t startBlock = -1,
+              double activity = 0.0);
 };
 
 struct BlockEntry {
