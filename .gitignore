@@ -67,3 +67,12 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# AI Agents
+.qwen/
+
+# Databases
+*.db
+
+# Logs
+*.log
