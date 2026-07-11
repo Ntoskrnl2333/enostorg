@@ -3,7 +3,6 @@
 #include <json/value.h>
 #include <json/writer.h>
 #include <sstream>
-#include <fstream>
 #include <iostream>
 
 using namespace enostorg;
@@ -70,39 +69,15 @@ int main()
 {
     auto ft = std::make_shared<FileTable>("storage.db");
 
-    // Web UI — serve static files from current directory
-    auto indexHtml = std::make_shared<std::string>();
-    {
-        std::ifstream in("index.html");
-        if (in) {
-            std::ostringstream ss;
-            ss << in.rdbuf();
-            *indexHtml = ss.str();
-        }
-    }
-    auto appJs = std::make_shared<std::string>();
-    {
-        std::ifstream in("app.js");
-        if (in) {
-            std::ostringstream ss;
-            ss << in.rdbuf();
-            *appJs = ss.str();
-        }
-    }
-
-    app().registerHandler("/", [indexHtml](const HttpRequestPtr&,
+    // Web UI — static HTML with inline JS (split to avoid MSVC line-length limits)
+    static const char kPage[] =
+#include "page.inc"
+    ;
+    app().registerHandler("/", [](const HttpRequestPtr&,
         std::function<void(const HttpResponsePtr&)>&& cb) {
         auto r = HttpResponse::newHttpResponse();
         r->setContentTypeCode(CT_TEXT_HTML);
-        r->setBody(*indexHtml);
-        cb(r);
-    });
-
-    app().registerHandler("/app.js", [appJs](const HttpRequestPtr&,
-        std::function<void(const HttpResponsePtr&)>&& cb) {
-        auto r = HttpResponse::newHttpResponse();
-        r->setContentTypeCode(CT_APPLICATION_X_JAVASCRIPT);
-        r->setBody(*appJs);
+        r->setBody(std::string(kPage));
         cb(r);
     });
 
