@@ -1,9 +1,11 @@
 #include "FileTable.h"
+#include "Config.h"
 #include <drogon/drogon.h>
 #include <json/value.h>
 #include <json/writer.h>
 #include <sstream>
 #include <iostream>
+#include <regex>
 
 using namespace enostorg;
 using namespace drogon;
@@ -52,24 +54,65 @@ HttpResponsePtr ok() {
     return HttpResponse::newHttpJsonResponse(j);
 }
 
-// Helper: get "path" from query string
 std::string getQueryParam(const HttpRequestPtr& req, const std::string& key) {
     auto& params = req->getParameters();
     auto it = params.find(key);
     return it != params.end() ? it->second : "";
 }
 
-} // anonymous namespace
+bool parseRange(const std::string& rangeHeader, uint64_t& start, uint64_t& end,
+                bool& hasEnd) {
+    std::regex re(R"(bytes\s*=\s*(\d+)\s*-\s*(\d*))", std::regex::icase);
+    std::smatch m;
+    if (!std::regex_search(rangeHeader, m, re)) return false;
+    start = std::stoull(m[1].str());
+    hasEnd = m[2].matched;
+    if (hasEnd) end = std::stoull(m[2].str());
+    return true;
+}
 
-// ===================================================================
-// Main
-// ===================================================================
+} // anonymous namespace
 
 int main()
 {
-    auto ft = std::make_shared<FileTable>("storage.db");
+    // ---- 加载配置 ----
+    Config cfg;
+    if (!cfg.load("config.ini"))
+        std::cerr << "[WARN] config.ini not found, using defaults" << std::endl;
 
-    // Web UI — static HTML with inline JS (split to avoid MSVC line-length limits)
+    std::string dbPath      = cfg.get("database.path", "storage.db");
+    int busyTimeout         = cfg.getInt("database.busy_timeout_ms", 5000);
+    std::string logLevel    = cfg.get("logging.level", "info");
+    std::string listenAddr  = cfg.get("server.listen", "0.0.0.0");
+    int listenPort          = cfg.getInt("server.port", 8080);
+    std::string blocksDir   = cfg.get("storage.blocks_dir", "blocks");
+
+    auto ft = std::make_shared<FileTable>(dbPath);
+    ft->setBusyTimeout(busyTimeout);
+    ft->setDataDir(blocksDir);
+
+    // 分块配置
+    ChunkConfig chunkCfg;
+    chunkCfg.strategy            = cfg.get("chunking.strategy", "variable");
+    chunkCfg.fixedSize           = cfg.getInt("chunking.fixed_size", 262144);
+    chunkCfg.minChunkSize        = cfg.getInt("chunking.min_chunk_size", 65536);
+    chunkCfg.maxChunkSize        = cfg.getInt("chunking.max_chunk_size", 1048576);
+    chunkCfg.rollingHashWindow   = cfg.getInt("chunking.rolling_hash_window", 48);
+    chunkCfg.rollingHashMaskBits = cfg.getInt("chunking.rolling_hash_mask_bits", 12);
+    ft->setChunkConfig(chunkCfg);
+
+    // ---- 日志 ----
+    {
+        trantor::Logger::LogLevel lvl = trantor::Logger::kInfo;
+        if (logLevel == "trace")      lvl = trantor::Logger::kTrace;
+        else if (logLevel == "debug")  lvl = trantor::Logger::kDebug;
+        else if (logLevel == "warn")   lvl = trantor::Logger::kWarn;
+        else if (logLevel == "error")  lvl = trantor::Logger::kError;
+        else if (logLevel == "fatal")  lvl = trantor::Logger::kFatal;
+        trantor::Logger::setLogLevel(lvl);
+    }
+
+    // ---- Web UI ----
     static const char kPage[] =
 #include "page.inc"
     ;
@@ -81,13 +124,13 @@ int main()
         cb(r);
     });
 
-    // GET/POST /api/files
+    // ===================================================================
+    // /api/files
+    // ===================================================================
     app().registerHandler("/api/files",
         [ft](const HttpRequestPtr& req,
              std::function<void(const HttpResponsePtr&)>&& cb) {
-
             if (req->getMethod() == Get) {
-                // GET /api/files?path=...  or  GET /api/files (list all)
                 auto qpath = getQueryParam(req, "path");
                 if (!qpath.empty()) {
                     auto f = ft->getFile(qpath);
@@ -101,15 +144,12 @@ int main()
                 cb(HttpResponse::newHttpJsonResponse(arr));
                 return;
             }
-
             if (req->getMethod() == Post) {
-                // POST /api/files  — create
                 Json::Value body;
                 Json::CharReaderBuilder b;
                 std::string errs;
                 std::istringstream s(std::string(req->bodyData(), req->bodyLength()));
-                if (!Json::parseFromStream(b, s, &body, &errs))
-                    { cb(err(400, "bad json")); return; }
+                if (!Json::parseFromStream(b, s, &body, &errs)) { cb(err(400, "bad json")); return; }
                 FileEntry f;
                 f.filePath     = body.get("file_path","").asString();
                 f.size         = body.get("size", Json::Value(0)).asInt64();
@@ -121,13 +161,10 @@ int main()
                 if (f.filePath.empty()) { cb(err(400, "file_path required")); return; }
                 if (!ft->insertFile(f)) { cb(err(409, "exists")); return; }
                 auto r = HttpResponse::newHttpJsonResponse(fileToJson(f));
-                r->setStatusCode(k201Created);
-                cb(r);
+                r->setStatusCode(k201Created); cb(r);
                 return;
             }
-
             if (req->getMethod() == Put) {
-                // PUT /api/files?path=...  — update
                 auto qpath = getQueryParam(req, "path");
                 if (qpath.empty()) { cb(err(400, "?path required")); return; }
                 auto f = ft->getFile(qpath);
@@ -136,8 +173,7 @@ int main()
                 Json::CharReaderBuilder b;
                 std::string errs;
                 std::istringstream s(std::string(req->bodyData(), req->bodyLength()));
-                if (!Json::parseFromStream(b, s, &body, &errs))
-                    { cb(err(400, "bad json")); return; }
+                if (!Json::parseFromStream(b, s, &body, &errs)) { cb(err(400, "bad json")); return; }
                 if (body.isMember("size"))          f->size           = body["size"].asInt64();
                 if (body.isMember("description"))   f->description    = body["description"].asString();
                 if (body.isMember("create_time"))   f->createTime     = body["create_time"].asInt64();
@@ -148,20 +184,16 @@ int main()
                 cb(HttpResponse::newHttpJsonResponse(fileToJson(*f)));
                 return;
             }
-
             if (req->getMethod() == Delete) {
-                // DELETE /api/files?path=...
                 auto qpath = getQueryParam(req, "path");
                 if (qpath.empty()) { cb(err(400, "?path required")); return; }
                 if (!ft->deleteFile(qpath)) { cb(err(404, "not found")); return; }
-                cb(ok());
-                return;
+                cb(ok()); return;
             }
-
             cb(err(405, "method not allowed"));
         });
 
-    // GET /api/files/blocks?path=...  — get blocks of a file
+    // GET /api/files/blocks?path=...
     app().registerHandler("/api/files/blocks",
         [ft](const HttpRequestPtr& req,
              std::function<void(const HttpResponsePtr&)>&& cb) {
@@ -171,25 +203,21 @@ int main()
             for (auto& b : ft->getFileBlocks(qpath))
                 arr.append(blockToJson(b));
             cb(HttpResponse::newHttpJsonResponse(arr));
-        },
-        {Get});
+        }, {Get});
 
-    // POST /api/files/blocks?path=...&block=N  — append block to file
+    // POST /api/files/blocks?path=...&block=N
     app().registerHandler("/api/files/blocks",
         [ft](const HttpRequestPtr& req,
              std::function<void(const HttpResponsePtr&)>&& cb) {
             auto qpath  = getQueryParam(req, "path");
             auto qblock = getQueryParam(req, "block");
-            if (qpath.empty() || qblock.empty())
-                { cb(err(400, "?path and ?block required")); return; }
+            if (qpath.empty() || qblock.empty()) { cb(err(400, "?path and ?block required")); return; }
             int64_t bid = std::stoll(qblock);
-            if (!ft->appendBlockToFile(qpath, bid))
-                { cb(err(404, "file or block not found")); return; }
+            if (!ft->appendBlockToFile(qpath, bid)) { cb(err(404, "file or block not found")); return; }
             cb(ok());
-        },
-        {Post});
+        }, {Post});
 
-    // POST /api/blocks  — create
+    // POST /api/blocks
     app().registerHandler("/api/blocks",
         [ft](const HttpRequestPtr& req,
              std::function<void(const HttpResponsePtr&)>&& cb) {
@@ -197,27 +225,22 @@ int main()
             Json::CharReaderBuilder b;
             std::string errs;
             std::istringstream s(std::string(req->bodyData(), req->bodyLength()));
-            if (!Json::parseFromStream(b, s, &body, &errs))
-                { cb(err(400, "bad json")); return; }
+            if (!Json::parseFromStream(b, s, &body, &errs)) { cb(err(400, "bad json")); return; }
             BlockEntry bk;
             bk.blockPath   = body.get("block_path","").asString();
             bk.sha256      = body.get("sha256","").asString();
             bk.blockSize   = body.get("block_size", Json::Value(0)).asInt64();
             bk.isBadBlock  = body.get("is_bad", false).asBool();
-            bk.nextBlockId  = -1;
-            bk.spareBlockId = -1;
-            if (bk.blockPath.empty() || bk.sha256.empty())
-                { cb(err(400, "block_path, sha256, block_size required")); return; }
+            bk.nextBlockId = -1; bk.spareBlockId = -1;
+            if (bk.blockPath.empty() || bk.sha256.empty()) { cb(err(400, "block_path, sha256, block_size required")); return; }
             int64_t id = ft->insertBlock(bk);
             if (id < 0) { cb(err(500, "insert failed")); return; }
             bk.id = id;
             auto r = HttpResponse::newHttpJsonResponse(blockToJson(bk));
-            r->setStatusCode(k201Created);
-            cb(r);
-        },
-        {Post});
+            r->setStatusCode(k201Created); cb(r);
+        }, {Post});
 
-    // PUT /api/blocks?block=N  — update
+    // PUT /api/blocks/update?block=N
     app().registerHandler("/api/blocks/update",
         [ft](const HttpRequestPtr& req,
              std::function<void(const HttpResponsePtr&)>&& cb) {
@@ -230,8 +253,7 @@ int main()
             Json::CharReaderBuilder b;
             std::string errs;
             std::istringstream s(std::string(req->bodyData(), req->bodyLength()));
-            if (!Json::parseFromStream(b, s, &body, &errs))
-                { cb(err(400, "bad json")); return; }
+            if (!Json::parseFromStream(b, s, &body, &errs)) { cb(err(400, "bad json")); return; }
             if (body.isMember("block_path"))  bk->blockPath  = body["block_path"].asString();
             if (body.isMember("sha256"))      bk->sha256     = body["sha256"].asString();
             if (body.isMember("block_size"))  bk->blockSize  = body["block_size"].asInt64();
@@ -240,8 +262,7 @@ int main()
             if (body.isMember("spare_block")) bk->spareBlockId = body["spare_block"].asInt64();
             ft->updateBlock(*bk);
             cb(HttpResponse::newHttpJsonResponse(blockToJson(*bk)));
-        },
-        {Put});
+        }, {Put});
 
     // DELETE /api/blocks/delete?block=N
     app().registerHandler("/api/blocks/delete",
@@ -252,10 +273,9 @@ int main()
             int64_t id = std::stoll(qblock);
             if (!ft->deleteBlock(id)) { cb(err(404, "not found")); return; }
             cb(ok());
-        },
-        {Delete});
+        }, {Delete});
 
-    // PATCH /api/blocks/bad?block=N  — mark bad
+    // PATCH /api/blocks/bad?block=N
     app().registerHandler("/api/blocks/bad",
         [ft](const HttpRequestPtr& req,
              std::function<void(const HttpResponsePtr&)>&& cb) {
@@ -264,26 +284,119 @@ int main()
             int64_t id = std::stoll(qblock);
             if (!ft->markBadBlock(id)) { cb(err(404, "not found")); return; }
             cb(ok());
-        },
-        {Patch});
+        }, {Patch});
 
-    // PATCH /api/blocks/spare?block=N&spare=M  — set spare
+    // PATCH /api/blocks/spare?block=N&spare=M
     app().registerHandler("/api/blocks/spare",
         [ft](const HttpRequestPtr& req,
              std::function<void(const HttpResponsePtr&)>&& cb) {
             auto qblock = getQueryParam(req, "block");
             auto qspare = getQueryParam(req, "spare");
-            if (qblock.empty() || qspare.empty())
-                { cb(err(400, "?block and ?spare required")); return; }
-            int64_t id    = std::stoll(qblock);
+            if (qblock.empty() || qspare.empty()) { cb(err(400, "?block and ?spare required")); return; }
+            int64_t id = std::stoll(qblock);
             int64_t spare = std::stoll(qspare);
             if (!ft->setSpareBlock(id, spare)) { cb(err(404, "not found")); return; }
             cb(ok());
-        },
-        {Patch});
+        }, {Patch});
 
-    std::cout << "Server ready on port 8080" << std::endl;
-    app().addListener("0.0.0.0", 8080);
+    // ===================================================================
+    // /api/objects — 对象级 API，数据存储到 block_path 文件系统文件
+    // ===================================================================
+    app().registerHandler("/api/objects",
+        [ft](const HttpRequestPtr& req,
+             std::function<void(const HttpResponsePtr&)>&& cb) {
+
+            auto qpath = getQueryParam(req, "path");
+
+            // POST: 创建对象
+            if (req->getMethod() == Post) {
+                if (qpath.empty()) { cb(err(400, "?path required")); return; }
+                std::vector<uint8_t> data(req->bodyData(), req->bodyData() + req->bodyLength());
+                auto result = ft->storeObject(qpath, data);
+                if (!result) { cb(err(409, "exists or insert failed")); return; }
+                auto r = HttpResponse::newHttpJsonResponse(fileToJson(*result));
+                r->setStatusCode(k201Created); cb(r);
+                return;
+            }
+
+            // GET: 获取对象数据
+            if (req->getMethod() == Get) {
+                if (qpath.empty()) { cb(err(400, "?path required")); return; }
+                auto file = ft->getFile(qpath);
+                if (!file) { cb(err(404, "not found")); return; }
+
+                auto rangeHdr = req->getHeader("Range");
+                if (!rangeHdr.empty()) {
+                    uint64_t rs = 0, re = 0;
+                    bool hasEnd = false;
+                    if (!parseRange(rangeHdr, rs, re, hasEnd)) { cb(err(400, "invalid Range")); return; }
+                    if (!hasEnd) re = file->size > 0 ? file->size - 1 : 0;
+                    auto rr = ft->getObjectDataRange(qpath, rs, re);
+                    if (!rr) { cb(err(500, "range read failed")); return; }
+                    auto r = HttpResponse::newHttpResponse();
+                    r->setStatusCode(k206PartialContent);
+                    r->setContentTypeCode(CT_APPLICATION_OCTET_STREAM);
+                    r->setBody(std::string(reinterpret_cast<const char*>(rr->data.data()), rr->data.size()));
+                    std::ostringstream cr; cr << "bytes " << rr->rangeStart << "-" << rr->rangeEnd << "/" << rr->totalSize;
+                    r->addHeader("Content-Range", cr.str());
+                    r->addHeader("Accept-Ranges", "bytes");
+                    cb(r); return;
+                }
+
+                auto data = ft->getObjectData(qpath);
+                auto r = HttpResponse::newHttpResponse();
+                r->setContentTypeCode(CT_APPLICATION_OCTET_STREAM);
+                r->setBody(std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+                r->addHeader("Accept-Ranges", "bytes");
+                cb(r); return;
+            }
+
+            // PATCH: 追加或指定偏移修改
+            if (req->getMethod() == Patch) {
+                if (qpath.empty()) { cb(err(400, "?path required")); return; }
+                auto file = ft->getFile(qpath);
+                if (!file) { cb(err(404, "not found")); return; }
+                std::vector<uint8_t> data(req->bodyData(), req->bodyData() + req->bodyLength());
+                auto offStr = getQueryParam(req, "offset");
+                if (!offStr.empty()) {
+                    uint64_t off = std::stoull(offStr);
+                    auto result = ft->patchObjectData(qpath, off, data);
+                    if (!result) { cb(err(500, "patch failed")); return; }
+                    cb(HttpResponse::newHttpJsonResponse(fileToJson(*result))); return;
+                }
+                auto result = ft->appendObjectData(qpath, data);
+                if (!result) { cb(err(500, "append failed")); return; }
+                cb(HttpResponse::newHttpJsonResponse(fileToJson(*result))); return;
+            }
+
+            // PUT: 重命名
+            if (req->getMethod() == Put) {
+                if (qpath.empty()) { cb(err(400, "?path required")); return; }
+                Json::Value body;
+                Json::CharReaderBuilder b;
+                std::string errs;
+                std::istringstream s(std::string(req->bodyData(), req->bodyLength()));
+                if (!Json::parseFromStream(b, s, &body, &errs)) { cb(err(400, "bad json")); return; }
+                std::string newPath = body.get("new_path", "").asString();
+                if (newPath.empty()) { cb(err(400, "new_path required")); return; }
+                if (!ft->renameObject(qpath, newPath)) { cb(err(409, "rename failed")); return; }
+                auto renamed = ft->getFile(newPath);
+                if (!renamed) { cb(err(500, "internal error")); return; }
+                cb(HttpResponse::newHttpJsonResponse(fileToJson(*renamed))); return;
+            }
+
+            // DELETE: 删除对象
+            if (req->getMethod() == Delete) {
+                if (qpath.empty()) { cb(err(400, "?path required")); return; }
+                if (!ft->deleteObject(qpath)) { cb(err(404, "not found")); return; }
+                cb(ok()); return;
+            }
+
+            cb(err(405, "method not allowed"));
+        });
+
+    std::cout << "Server ready on " << listenAddr << ":" << listenPort << std::endl;
+    app().addListener(listenAddr, listenPort);
     app().run();
     return 0;
 }
