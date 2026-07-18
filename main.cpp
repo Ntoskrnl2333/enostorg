@@ -2,11 +2,14 @@
 #include "DiskManager.h"
 #include "Config.h"
 #include <drogon/drogon.h>
+#include <trantor/utils/AsyncFileLogger.h>
 #include <json/value.h>
 #include <json/writer.h>
 #include <sstream>
-#include <iostream>
 #include <regex>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 using namespace enostorg;
 using namespace drogon;
@@ -74,19 +77,46 @@ bool parseRange(const std::string& rangeHeader, uint64_t& start, uint64_t& end,
 
 } // anonymous namespace
 
+static std::shared_ptr<trantor::AsyncFileLogger> g_fileLogger;
+
 int main()
 {
     // ---- 加载配置 ----
     Config cfg;
     if (!cfg.load("config.ini"))
-        std::cerr << "[WARN] config.ini not found, using defaults" << std::endl;
+        LOG_WARN << "config.ini not found, using defaults";
 
     std::string dbPath      = cfg.get("database.path", "storage.db");
     int busyTimeout         = cfg.getInt("database.busy_timeout_ms", 5000);
     std::string logLevel    = cfg.get("logging.level", "info");
+    std::string logFile     = cfg.get("logging.file", "");
+    bool logConsole         = cfg.getBool("logging.console", true);
     std::string listenAddr  = cfg.get("server.listen", "0.0.0.0");
     int listenPort          = cfg.getInt("server.port", 8080);
     std::string blocksDir   = cfg.get("storage.blocks_dir", "blocks");
+
+    // ---- 日志初始化（必须在任何日志输出前） ----
+    {
+        trantor::Logger::LogLevel lvl = trantor::Logger::kInfo;
+        if (logLevel == "trace")      lvl = trantor::Logger::kTrace;
+        else if (logLevel == "debug")  lvl = trantor::Logger::kDebug;
+        else if (logLevel == "warn")   lvl = trantor::Logger::kWarn;
+        else if (logLevel == "error")  lvl = trantor::Logger::kError;
+        else if (logLevel == "fatal")  lvl = trantor::Logger::kFatal;
+        trantor::Logger::setLogLevel(lvl);
+    }
+    if (!logFile.empty()) {
+        g_fileLogger = std::make_shared<trantor::AsyncFileLogger>();
+        auto lp = fs::path(logFile);
+        g_fileLogger->setFileName(lp.stem().string(), ".log",
+                                  lp.parent_path().string());
+        g_fileLogger->startLogging();
+        trantor::Logger::setOutputFunction(
+            [](const char* msg, const uint64_t len) { g_fileLogger->output(msg, len); },
+            []() { g_fileLogger->flush(); });
+    } else if (!logConsole) {
+        trantor::Logger::setOutputFunction([](const char*, uint64_t){}, [](){});
+    }
 
     auto ft = std::make_shared<FileTable>(dbPath);
     ft->setBusyTimeout(busyTimeout);
@@ -112,17 +142,6 @@ int main()
     bkCfg.strategy = cfg.get("backup.strategy", "mirror");
     bkCfg.replicas = cfg.getInt("backup.replicas", 1);
     ft->setBackupConfig(bkCfg);
-
-    // ---- 日志 ----
-    {
-        trantor::Logger::LogLevel lvl = trantor::Logger::kInfo;
-        if (logLevel == "trace")      lvl = trantor::Logger::kTrace;
-        else if (logLevel == "debug")  lvl = trantor::Logger::kDebug;
-        else if (logLevel == "warn")   lvl = trantor::Logger::kWarn;
-        else if (logLevel == "error")  lvl = trantor::Logger::kError;
-        else if (logLevel == "fatal")  lvl = trantor::Logger::kFatal;
-        trantor::Logger::setLogLevel(lvl);
-    }
 
     // ---- Web UI ----
     static const char kPage[] =
@@ -407,7 +426,7 @@ int main()
             cb(err(405, "method not allowed"));
         });
 
-    std::cout << "Server ready on " << listenAddr << ":" << listenPort << std::endl;
+    LOG_INFO << "Server ready on " << listenAddr << ":" << listenPort;
     app().addListener(listenAddr, listenPort);
     app().run();
     return 0;

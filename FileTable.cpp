@@ -2,6 +2,7 @@
 #include "sha256.h"
 #include "DiskManager.h"
 
+#include <trantor/utils/Logger.h>
 #include <sqlite3.h>
 #include <cstring>
 #include <sstream>
@@ -536,7 +537,12 @@ int FileTable::diskIndexFromPath(const std::string& blockPath) const {
 
 void FileTable::deleteBlockRing(int64_t blockId) {
     auto mainBlock = getBlock(blockId);
-    if (!mainBlock) return;
+    if (!mainBlock) {
+        LOG_WARN << "deleteBlockRing block=" << blockId << " not found";
+        return;
+    }
+
+    int replicaCount = 0;
 
     // Walk spare ring: delete all replica files + metadata
     int64_t spareId = mainBlock->spareBlockId;
@@ -550,6 +556,9 @@ void FileTable::deleteBlockRing(int64_t blockId) {
             if (di >= 0) diskManager_->trackDeallocation(di, static_cast<int64_t>(rep->blockSize));
         }
         deleteBlockFile(rep->blockPath);
+        LOG_DEBUG << "deleteBlockRing: deleted replica block=" << spareId
+                  << " path=" << rep->blockPath;
+        replicaCount++;
 
         sqlite3_stmt* stmt = nullptr;
         if (prepareStatement("DELETE FROM blocks WHERE id=?", &stmt)) {
@@ -568,6 +577,8 @@ void FileTable::deleteBlockRing(int64_t blockId) {
         if (di >= 0) diskManager_->trackDeallocation(di, static_cast<int64_t>(mainBlock->blockSize));
     }
     deleteBlockFile(mainBlock->blockPath);
+    LOG_DEBUG << "deleteBlockRing: deleted main block=" << blockId
+              << " path=" << mainBlock->blockPath;
 
     sqlite3_stmt* stmt = nullptr;
     if (prepareStatement("DELETE FROM blocks WHERE id=?", &stmt)) {
@@ -575,33 +586,52 @@ void FileTable::deleteBlockRing(int64_t blockId) {
         sqlite3_step(stmt);
         sqlite3_finalize(stmt);
     }
+
+    LOG_INFO << "deleteBlockRing block=" << blockId
+             << " replicas=" << replicaCount
+             << " path=" << mainBlock->blockPath;
 }
 
 std::optional<FileEntry> FileTable::storeObject(const std::string& filePath,
                                                  const std::vector<uint8_t>& data,
                                                  const std::string& description) {
-    if (fileExists(filePath)) return std::nullopt;
+    if (fileExists(filePath)) {
+        LOG_WARN << "storeObject path=" << filePath << " failed: already exists";
+        return std::nullopt;
+    }
 
     auto chunks = chunkData(data);
     int repCount = backupCfg_.replicas;
     bool doBackup = (diskManager_ && backupCfg_.strategy == "mirror" && repCount > 0);
+
+    LOG_DEBUG << "storeObject path=" << filePath << " size=" << data.size()
+              << " chunks=" << chunks.size() << " backup=" << (doBackup ? repCount : 0);
 
     beginTransaction();
 
     std::vector<int64_t> mainIds;
     std::vector<std::vector<int64_t>> repIds;
 
-    for (auto& chunk : chunks) {
+    for (size_t ci = 0; ci < chunks.size(); ci++) {
+        auto& chunk = chunks[ci];
         std::string sha = SHA256::hash(chunk);
 
         if (doBackup) {
             int need = 1 + repCount;
             auto disks = diskManager_->selectDisks(need, {});
-            if ((int)disks.size() < need) { rollbackTransaction(); return std::nullopt; }
+            if ((int)disks.size() < need) {
+                LOG_ERROR << "storeObject path=" << filePath << " chunk=" << ci
+                          << " failed: need " << need << " disks, got " << disks.size();
+                rollbackTransaction(); return std::nullopt;
+            }
 
             // Main block
             std::string mainPath = generateBlockPath(diskManager_->getDisk(disks[0]).name);
-            if (!writeBlockFile(mainPath, chunk)) { rollbackTransaction(); return std::nullopt; }
+            if (!writeBlockFile(mainPath, chunk)) {
+                LOG_ERROR << "storeObject path=" << filePath << " chunk=" << ci
+                          << " write main failed: " << mainPath;
+                rollbackTransaction(); return std::nullopt;
+            }
             diskManager_->trackAllocation(disks[0], chunk.size());
 
             BlockEntry mb;
@@ -616,7 +646,11 @@ std::optional<FileEntry> FileTable::storeObject(const std::string& filePath,
             std::vector<int64_t> reps;
             for (int r = 0; r < repCount; r++) {
                 std::string rpath = generateBlockPath(diskManager_->getDisk(disks[1 + r]).name);
-                if (!writeBlockFile(rpath, chunk)) { rollbackTransaction(); return std::nullopt; }
+                if (!writeBlockFile(rpath, chunk)) {
+                    LOG_ERROR << "storeObject path=" << filePath << " chunk=" << ci
+                              << " write replica[" << r << "] failed: " << rpath;
+                    rollbackTransaction(); return std::nullopt;
+                }
                 diskManager_->trackAllocation(disks[1 + r], chunk.size());
 
                 BlockEntry rb;
@@ -671,13 +705,20 @@ std::optional<FileEntry> FileTable::storeObject(const std::string& filePath,
     f.startBlockId = mainIds.empty() ? -1 : mainIds[0];
     f.accessActivity = 0.0;
 
-    if (!insertFile(f)) { rollbackTransaction(); return std::nullopt; }
+    if (!insertFile(f)) {
+        LOG_ERROR << "storeObject path=" << filePath << " insertFile failed, rolling back";
+        rollbackTransaction(); return std::nullopt;
+    }
     commitTransaction();
+    LOG_INFO << "storeObject path=" << filePath << " size=" << data.size()
+             << " chunks=" << mainIds.size() << " startBlock=" << f.startBlockId;
     return f;
 }
 
 std::vector<uint8_t> FileTable::getObjectData(const std::string& filePath) const {
-    return readBlocksData(filePath);
+    auto data = readBlocksData(filePath);
+    LOG_DEBUG << "getObjectData path=" << filePath << " size=" << data.size();
+    return data;
 }
 
 std::optional<FileTable::RangeResult> FileTable::getObjectDataRange(
@@ -726,6 +767,9 @@ std::optional<FileTable::RangeResult> FileTable::getObjectDataRange(
     rr.totalSize = file->size;
     rr.rangeStart = start;
     rr.rangeEnd = end;
+    LOG_DEBUG << "getObjectDataRange path=" << filePath
+              << " range=[" << start << "," << end << "]"
+              << " total=" << file->size << " returned=" << rr.data.size();
     return rr;
 }
 
@@ -831,6 +875,8 @@ std::optional<FileEntry> FileTable::appendObjectData(const std::string& filePath
     file->modifyTime = std::time(nullptr);
     updateFile(*file);
     commitTransaction();
+    LOG_INFO << "appendObjectData path=" << filePath << " appendSize=" << data.size()
+             << " newSize=" << file->size;
     return file;
 }
 
@@ -857,6 +903,8 @@ std::optional<FileEntry> FileTable::patchObjectData(const std::string& filePath,
     newFile->createTime = file->createTime;
     newFile->modifyTime = std::time(nullptr);
     updateFile(*newFile);
+    LOG_INFO << "patchObjectData path=" << filePath << " offset=" << offset
+             << " patchSize=" << data.size() << " newSize=" << newFile->size;
     return newFile;
 }
 
@@ -870,10 +918,13 @@ bool FileTable::renameObject(const std::string& oldPath, const std::string& newP
     sqlite3_bind_text(stmt, 3, oldPath.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+    if (rc == SQLITE_DONE)
+        LOG_INFO << "renameObject from=" << oldPath << " to=" << newPath;
     return rc == SQLITE_DONE;
 }
 
 bool FileTable::deleteObject(const std::string& filePath) {
+    LOG_INFO << "deleteObject path=" << filePath;
     return deleteFile(filePath);
 }
 

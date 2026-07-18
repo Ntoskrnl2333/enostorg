@@ -1,9 +1,9 @@
 #include "DiskManager.h"
 #include "Config.h"
 
+#include <trantor/utils/Logger.h>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <algorithm>
 #include <random>
 
@@ -61,7 +61,7 @@ bool DiskManager::discover(const std::string& disksDir) {
         disks_.push_back(std::move(d));
     }
 
-    std::cout << "[DiskManager] discovered " << disks_.size() << " disk(s)" << std::endl;
+    LOG_INFO << "discovered " << disks_.size() << " disk(s)";
     logStatus();
     return !disks_.empty();
 }
@@ -106,6 +106,7 @@ std::vector<int> DiskManager::selectDisks(int count, const std::vector<int>& exc
         pool.erase(pool.begin() + picked);
     }
 
+    LOG_DEBUG << "selectDisks need=" << count << " got=" << result.size();
     return result;
 }
 
@@ -124,13 +125,12 @@ void DiskManager::trackDeallocation(int diskIndex, int64_t size) {
 void DiskManager::logStatus() const {
     for (size_t i = 0; i < disks_.size(); i++) {
         auto& d = disks_[i];
-        std::cout << "  [" << i << "] " << d.name
-                  << " cap=" << (d.capacity / 1048576) << "MB"
-                  << " avail=" << (d.available / 1024) << "KB"
-                  << " speed=" << d.speedRating
-                  << " weight=" << d.weight
-                  << (d.writable ? " RW" : " RO")
-                  << std::endl;
+        LOG_INFO << "  [" << i << "] " << d.name
+                 << " cap=" << (d.capacity / 1048576) << "MB"
+                 << " avail=" << (d.available / 1024) << "KB"
+                 << " speed=" << d.speedRating
+                 << " weight=" << d.weight
+                 << (d.writable ? " RW" : " RO");
     }
 }
 
