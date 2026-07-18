@@ -131,34 +131,73 @@ weight = auto               # 分配权重：auto（=容量×速率）| 数值 |
 
 ### 两级存储
 
-```
-┌──────────────────────────────────────────┐
-│              /api/objects                 │
-│    POST / GET / PATCH / PUT / DELETE      │
-└──────────┬───────────────────┬───────────┘
-           │                   │
-           ▼                   ▼
-┌──────────────────┐  ┌──────────────────────────────┐
-│   SQLite 元数据    │  │    多磁盘数据文件              │
-│                  │  │                              │
-│  files 表        │  │  blocks_dir/                 │
-│  ├─ file_path   │  │  ├── disk01/                 │
-│  ├─ size        │  │  │   ├── block_xxx.dat (主块)  │
-│  ├─ start_block │  │  │   └── block_yyy.dat        │
-│  └─ ...         │  │  ├── disk02/                 │
-│                  │  │  │   ├── block_xxx.dat (副本) │
-│  blocks 表       │  │  │   └── block_zzz.dat        │
-│  ├─ block_path  │  │  └── disk03/                 │
-│  ├─ next_block  │  │      └── ...                  │
-│  ├─ spare_block │  │                              │
-│  ├─ block_size  │  │  每个块文件 = 原始二进制数据     │
-│  └─ sha256      │  │                              │
-└──────────────────┘  └──────────────────────────────┘
+```mermaid
+flowchart TB
+    API["/api/objects<br/>POST / GET / PATCH / PUT / DELETE"]
+
+    API --> META
+    API --> DATA
+
+    subgraph META["SQLite 元数据"]
+        FILES["files 表<br/>file_path<br/>size<br/>start_block<br/>..."]
+
+        BLOCKS["blocks 表<br/>block_path<br/>next_block<br/>spare_block<br/>block_size<br/>sha256"]
+    end
+
+    subgraph DATA["多磁盘数据文件"]
+        subgraph D3["disk03"]
+            B5["..."]
+        end
+        
+        subgraph D2["disk02"]
+            B3["block_xxx.dat<br/>(副本)"]
+            B4["block_zzz.dat"]
+        end
+
+        subgraph D1["disk01"]
+            B1["block_xxx.dat<br/>(主块)"]
+            B2["block_yyy.dat"]
+        end
+
+        NOTE["每个块文件 = 原始二进制数据"]
+    end
 ```
 
-- **SQLite 只存元数据**：不包含 `BLOB` 列，数据分布在多个磁盘文件夹下
+- **SQLite 只存元数据**：不包含实际数据，数据分布在多个磁盘文件夹下
 - **block_path** 格式：`<disk_name>/block_<ts>_<n>.dat`
 - **块链 + 备份环**：`next_block` 串联主块，`spare_block` 串联每个主块的副本环
+
+### SQLite 表间联系
+
+```mermaid
+flowchart TB
+    FILE["files 表<br/>start_block"]
+
+    B1["block_xxx"]
+    B2["block_yyy"]
+    B3["block_zzz"]
+
+    FILE --> B1
+    B1 -->|next_block| B2
+    B2 -->|next_block| B3
+
+    B1 -.主块.-> D1["disk01/block_xxx.dat"]
+    B1 -.副本.-> D2["disk02/block_xxx.dat"]
+    D2 -.spare_block.-> D1
+    D1 -.spare_block.-> D2
+    D2 -->|next_block| B2
+
+    B2 -.主块.-> D3["disk01/block_yyy.dat"]
+    B2 -.副本.-> D4["disk03/block_yyy.dat"]
+    D3 -.spare_block.-> D4
+    D4 -.spare_block.-> D3
+    D4 -->|next_block| B3
+
+    B3 -.主块.-> D5["disk02/block_zzz.dat"]
+    B3 -.副本.-> D6["disk01/block_zzz.dat"]
+    D5 -.spare_block.-> D6
+    D6 -.spare_block.-> D5
+```
 
 ### 文件分块
 
