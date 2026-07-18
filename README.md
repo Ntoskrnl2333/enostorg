@@ -87,7 +87,43 @@ min_chunk_size = 65536     # 可变分块最小大小（字节）
 max_chunk_size = 1048576   # 可变分块最大大小（字节）
 rolling_hash_window = 48   # 滚动哈希滑动窗口大小（字节）
 rolling_hash_mask_bits = 12 # 掩码位数（约每 2^bits 字节一个边界）
+
+[backup]
+strategy = mirror            # 备份策略：none（不备份）| mirror（副本环）
+replicas = 1                 # 每个主块的副本数（需 ≥ replicas+1 个可用磁盘）
 ```
+
+### diskinfo.ini（磁盘元数据）
+
+每个物理/虚拟磁盘对应 `blocks_dir` 下的一个子文件夹，其中放置 `diskinfo.ini` 标识该磁盘可用。
+
+```ini
+[disk]
+name = disk01               # 文件夹名（自动匹配）
+label = Fast SSD 1TB        # 可读描述
+capacity = 1000000000000    # 总容量（字节）
+speed_rating = 8            # 速率等级 1-10
+weight = auto               # 分配权重：auto（=容量×速率）| 数值 | 0（只读）
+```
+
+- 文件夹下无 `diskinfo.ini` → 跳过，磁盘不可用
+- `weight = 0` 或 `capacity = 0` → 只读，不接收新数据
+
+### 磁盘发现与权重分配
+
+启动时扫描 `blocks_dir` 下所有子文件夹，识别有效磁盘。写入时按权重分配：
+
+```
+权重 = (weight==auto) ? capacity * speed_rating : weight
+选中概率 P_i = W_i / ΣW_j
+```
+
+例如 3 盘配置：
+| 磁盘 | 容量 | 速率 | 权重 | 选中概率 |
+|------|------|------|------|----------|
+| disk01 | 1GB | 8 | 8,192 | 11.5% |
+| disk02 | 10GB | 3 | 30,720 | 43.2% |
+| disk03 | 5GB | 6 | 30,720 | 43.2% |
 
 ---
 
@@ -102,26 +138,27 @@ rolling_hash_mask_bits = 12 # 掩码位数（约每 2^bits 字节一个边界）
 └──────────┬───────────────────┬───────────┘
            │                   │
            ▼                   ▼
-┌──────────────────┐  ┌──────────────────────┐
-│   SQLite 元数据    │  │  文件系统数据文件     │
-│                  │  │                      │
-│  files 表        │  │  blocks/             │
-│  ├─ file_path   │  │  ├─ block_*.dat      │
-│  ├─ size        │  │  ├─ block_*.dat      │
-│  ├─ start_block │  │  └─ ...              │
-│  └─ ...         │  │                      │
-│                  │  │  block 文件内容 =     │
-│  blocks 表       │  │  原始二进制数据       │
-│  ├─ block_path  │  │                      │
-│  ├─ next_block  │  │                      │
-│  ├─ block_size  │  │                      │
-│  └─ sha256      │  │                      │
-└──────────────────┘  └──────────────────────┘
+┌──────────────────┐  ┌──────────────────────────────┐
+│   SQLite 元数据    │  │    多磁盘数据文件              │
+│                  │  │                              │
+│  files 表        │  │  blocks_dir/                 │
+│  ├─ file_path   │  │  ├── disk01/                 │
+│  ├─ size        │  │  │   ├── block_xxx.dat (主块)  │
+│  ├─ start_block │  │  │   └── block_yyy.dat        │
+│  └─ ...         │  │  ├── disk02/                 │
+│                  │  │  │   ├── block_xxx.dat (副本) │
+│  blocks 表       │  │  │   └── block_zzz.dat        │
+│  ├─ block_path  │  │  └── disk03/                 │
+│  ├─ next_block  │  │      └── ...                  │
+│  ├─ spare_block │  │                              │
+│  ├─ block_size  │  │  每个块文件 = 原始二进制数据     │
+│  └─ sha256      │  │                              │
+└──────────────────┘  └──────────────────────────────┘
 ```
 
-- **SQLite 只存元数据**：不包含 `BLOB` 列，数据以文件形式存储在 `blocks_dir` 目录下
-- **block_path** 列记录数据块对应的磁盘文件路径（相对路径，基于 `blocks_dir` 拼接）
-- **块链结构**：`files.start_block` → `blocks.next_block` 形成单向链表
+- **SQLite 只存元数据**：不包含 `BLOB` 列，数据分布在多个磁盘文件夹下
+- **block_path** 格式：`<disk_name>/block_<ts>_<n>.dat`
+- **块链 + 备份环**：`next_block` 串联主块，`spare_block` 串联每个主块的副本环
 
 ### 文件分块
 
@@ -285,6 +322,27 @@ hash = (hash - oldest_byte * BASE^(w-1)) * BASE + new_byte
 
 **优势**：相同内容的边界稳定，即使数据发生偏移（插入/删除），已存在的块边界不受影响，适合增量备份和去重。
 
+### 备份环
+
+当 `[backup]` 配置为 `strategy=mirror` 时，`/api/objects` 写入的每个主块会同时在另外的磁盘上创建副本，形成 `spare_block` 环。
+
+```
+主链（next_block）:
+  M1.next_block ──→ M2.next_block ──→ M3 ──→ -1
+  R1a.next_block ──→ M2  (副本 next_block 同主块)
+  R1b.next_block ──→ M2  (副本 next_block 同主块)
+
+副本环（spare_block）:
+  M1.spare_block ──→ R1a.spare_block ──→ R1b.spare_block ──→ M1 (闭合)
+  M2.spare_block ──→ R2a ──→ R2b ──→ M2
+  ...
+```
+
+- 每个环内的所有块（主块 + 副本）**不能在同一磁盘上**
+- 写入 N 个副本需至少 N+1 个可用磁盘，不足则写入中止
+- `GET` 返回原始数据（自动读取主块）；读取失败时可沿 `spare_block` 环查找可用副本
+- `DELETE` 自动遍历环清理所有副本文件和元数据
+
 ---
 
 ## 数据流示例
@@ -327,7 +385,13 @@ enostorg/
 ├── config.ini
 ├── storage.db           ← SQLite: files + blocks 表
 └── blocks/              ← [storage].blocks_dir
-    ├── block_1784365043466_1.dat   ← POST 创建
-    ├── block_1784365043467_2.dat   ← PATCH 追加
-    └── ...
+    ├── disk01/          ← 第一块磁盘（高速）
+    │   ├── diskinfo.ini
+    │   └── block_1784365043466_1.dat   ← 主块
+    ├── disk02/          ← 第二块磁盘（大容量）
+    │   ├── diskinfo.ini
+    │   └── block_1784365043467_2.dat   ← 副本 (spare_block ring)
+    └── disk03/          ← 第三块磁盘
+        ├── diskinfo.ini
+        └── ...
 ```
