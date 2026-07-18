@@ -99,7 +99,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(drogon)
 
-add_executable(${PROJECT_NAME} main.cpp FileTable.cpp page.inc)
+add_executable(${PROJECT_NAME} main.cpp FileTable.cpp DiskManager.cpp page.inc)
 
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /utf-8)

@@ -1,4 +1,5 @@
 #include "FileTable.h"
+#include "DiskManager.h"
 #include "Config.h"
 #include <drogon/drogon.h>
 #include <json/value.h>
@@ -100,6 +101,17 @@ int main()
     chunkCfg.rollingHashWindow   = cfg.getInt("chunking.rolling_hash_window", 48);
     chunkCfg.rollingHashMaskBits = cfg.getInt("chunking.rolling_hash_mask_bits", 12);
     ft->setChunkConfig(chunkCfg);
+
+    // ---- 磁盘发现与备份配置 ----
+    std::string disksDir = cfg.get("storage.blocks_dir", "blocks");
+    auto dm = std::make_shared<DiskManager>();
+    dm->discover(disksDir);
+    ft->setDiskManager(dm.get());
+
+    BackupConfig bkCfg;
+    bkCfg.strategy = cfg.get("backup.strategy", "mirror");
+    bkCfg.replicas = cfg.getInt("backup.replicas", 1);
+    ft->setBackupConfig(bkCfg);
 
     // ---- 日志 ----
     {

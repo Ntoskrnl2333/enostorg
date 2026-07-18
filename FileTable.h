@@ -12,28 +12,35 @@ struct sqlite3_stmt;
 
 namespace enostorg {
 
+class DiskManager;
+
+struct BackupConfig {
+    std::string strategy = "mirror";
+    int replicas = 1;
+};
+
 struct FileEntry {
     std::string filePath;
-    std::time_t createTime;
-    std::time_t modifyTime;
-    uint64_t size;
+    std::time_t createTime = 0;
+    std::time_t modifyTime = 0;
+    uint64_t size = 0;
     std::string description;
-    int64_t startBlockId;
-    double accessActivity;
+    int64_t startBlockId = -1;
+    double accessActivity = 0.0;
 
-    FileEntry() : accessActivity(0.0) {}
+    FileEntry() = default;
     FileEntry(const std::string& path, std::time_t ctime, std::time_t mtime,
               uint64_t sz, const std::string& desc, int64_t startBlock = -1,
               double activity = 0.0);
 };
 
 struct BlockEntry {
-    int64_t id;
+    int64_t id = 0;
     std::string blockPath;
-    int64_t nextBlockId;
-    int64_t spareBlockId;
-    bool isBadBlock;
-    uint64_t blockSize;
+    int64_t nextBlockId = -1;
+    int64_t spareBlockId = -1;
+    bool isBadBlock = false;
+    uint64_t blockSize = 0;
     std::string sha256;
 
     BlockEntry() = default;
@@ -90,6 +97,10 @@ public:
     void setChunkConfig(const ChunkConfig& cfg) { chunkCfg_ = cfg; }
     const ChunkConfig& chunkConfig() const { return chunkCfg_; }
 
+    void setDiskManager(DiskManager* dm) { diskManager_ = dm; }
+    void setBackupConfig(const BackupConfig& cfg) { backupCfg_ = cfg; }
+    const BackupConfig& backupConfig() const { return backupCfg_; }
+
     // ---- 基于文件系统的对象操作（数据存文件，block_path 记录路径） ----
     // 读取单个块文件的数据
     std::vector<uint8_t> readBlockFile(const std::string& blockPath) const;
@@ -139,6 +150,8 @@ private:
     ChunkConfig chunkCfg_;
     std::string dataDir_;
     mutable int blockCounter_ = 0;
+    DiskManager* diskManager_ = nullptr;
+    BackupConfig backupCfg_;
 
     void initSchema();
     bool execute(const std::string& sql) const;
@@ -148,7 +161,9 @@ private:
     BlockEntry extractBlockEntry(sqlite3_stmt* stmt) const;
 
     std::string resolveBlockPath(const std::string& blockPath) const;
-    std::string generateBlockPath() const;
+    std::string generateBlockPath(const std::string& diskName) const;
+    int diskIndexFromPath(const std::string& blockPath) const;
+    void deleteBlockRing(int64_t blockId);
     void deleteAllBlocks(int64_t startBlockId);
 
     // 分块

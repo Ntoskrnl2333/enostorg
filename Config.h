@@ -53,6 +53,13 @@ public:
         catch (...) { return defaultVal; }
     }
 
+    int64_t getInt64(const std::string& key, int64_t defaultVal = 0) const {
+        auto it = data_.find(key);
+        if (it == data_.end()) return defaultVal;
+        try { return std::stoll(it->second); }
+        catch (...) { return defaultVal; }
+    }
+
     bool getBool(const std::string& key, bool defaultVal = false) const {
         auto it = data_.find(key);
         if (it == data_.end()) return defaultVal;
