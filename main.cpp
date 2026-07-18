@@ -102,7 +102,7 @@ int main()
         else if (logLevel == "debug")  lvl = trantor::Logger::kDebug;
         else if (logLevel == "warn")   lvl = trantor::Logger::kWarn;
         else if (logLevel == "error")  lvl = trantor::Logger::kError;
-        else if (logLevel == "fatal")  lvl = trantor::Logger::kFatal;
+        else if (logLevel == "fatal" || logLevel == "critical")  lvl = trantor::Logger::kFatal;
         trantor::Logger::setLogLevel(lvl);
     }
     if (!logFile.empty()) {
@@ -111,9 +111,18 @@ int main()
         g_fileLogger->setFileName(lp.stem().string(), ".log",
                                   lp.parent_path().string());
         g_fileLogger->startLogging();
-        trantor::Logger::setOutputFunction(
-            [](const char* msg, const uint64_t len) { g_fileLogger->output(msg, len); },
-            []() { g_fileLogger->flush(); });
+        if (logConsole) {
+            trantor::Logger::setOutputFunction(
+                [](const char* msg, const uint64_t len) {
+                    fwrite(msg, 1, len, stderr);
+                    g_fileLogger->output(msg, len);
+                },
+                []() { fflush(stderr); g_fileLogger->flush(); });
+        } else {
+            trantor::Logger::setOutputFunction(
+                [](const char* msg, const uint64_t len) { g_fileLogger->output(msg, len); },
+                []() { g_fileLogger->flush(); });
+        }
     } else if (!logConsole) {
         trantor::Logger::setOutputFunction([](const char*, uint64_t){}, [](){});
     }
