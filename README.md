@@ -23,36 +23,89 @@
 
 ### 前置条件
 
-- **CMake** ≥ 3.16
-- **Visual Studio 2022**（Windows）或 **GCC** / **Clang**（Linux/macOS）
-- 编译器需支持 **C++23**（MSVC v19.44+ / GCC 14+ / Clang 18+）
+- **CMake** ≥ 3.16（推荐 3.20+）
+- 支持 **C++23** 的编译器：
+  - **Windows**：MSVC v19.44+（Visual Studio 2022 17.10+）
+  - **Linux**：GCC 14+ 或 Clang 18+
+  - **macOS**：Apple Clang 16+（Xcode 16+）或 Clang 18+
+- **Git**（`FetchContent` 拉取依赖仓库时使用）
+- 网络连接（首次构建时自动下载依赖）
 
-### 编译
+> 依赖无需手动安装，CMake 通过 `FetchContent` 自动下载并编译：
 
-```bash
+| 依赖 | 版本 | 来源 | 用途 |
+|------|------|------|------|
+| Drogon | 1.9.9 | GitHub | HTTP 框架、路由、JSON 序列化 |
+| SQLite | 3.49 | sqlite.org | 元数据存储（文件 + 块记录） |
+| zlib | 1.3.1 | GitHub | Drogon 依赖 |
+| jsoncpp | 1.9.6 | GitHub | JSON 解析/序列化 |
+
+### Windows（Visual Studio 2022）
+
+```bat
 cd enostorg
-mkdir build && cd build
-cmake .. -G "Visual Studio 17 2022" -A x64
-cmake --build . --config Release
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
 ```
 
-CMake 会自动使用 `FetchContent` 下载依赖：
+运行（生成的可执行文件位于 `build\Release\`）：
 
-| 依赖 | 来源 | 用途 |
-|------|------|------|
-| Drogon 1.9.9 | GitHub | HTTP 框架、路由、JSON 序列化 |
-| SQLite 3.49 | sqlite.org | 元数据存储（文件 + 块记录） |
-| zlib 1.3.1 | GitHub | Drogon 依赖 |
-| jsoncpp 1.9.6 | GitHub | JSON 解析/序列化 |
-
-### 运行
-
-```bash
-cd Release
+```bat
+cd build\Release
 enostorg.exe
 ```
 
-默认监听 `http://0.0.0.0:8080`。
+### Linux（GCC / Clang）
+
+```bash
+cd enostorg
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+```
+
+运行：
+
+```bash
+cd build
+./enostorg
+```
+
+### macOS（Xcode / Apple Clang）
+
+```bash
+cd enostorg
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(sysctl -n hw.ncpu)"
+```
+
+或生成 Xcode 工程：
+
+```bash
+cmake -S . -B build -G Xcode
+cmake --build build --config Release
+```
+
+运行（两种方式生成的可执行文件均在 `build/` 下，Xcode 工程在 `build/Release/`）：
+
+```bash
+cd build
+./enostorg
+```
+
+### 使用 Ninja（可选，更快）
+
+安装了 Ninja 的平台上可改用 Ninja 生成器：
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+### 运行说明
+
+程序默认监听 `http://0.0.0.0:8080`。`config.ini`、`storage.db` 与 `blocks/` 均相对于**工作目录**（启动程序时所在目录）解析，请从想要存放数据的位置启动程序。
+
+> 提示：若 `blocks/` 下没有任何带 `diskinfo.ini` 的磁盘目录，且 `[backup] strategy=mirror`，写入对象会因可用磁盘不足而中止——请先按 [diskinfo.ini（磁盘元数据）](#diskinfoini磁盘元数据) 一节创建至少一块磁盘。
 
 ---
 
@@ -103,7 +156,7 @@ name = disk01               # 文件夹名（自动匹配）
 label = Fast SSD 1TB        # 可读描述
 capacity = 1000000000000    # 总容量（字节）
 speed_rating = 8            # 速率等级 1-10
-weight = auto               # 分配权重：auto（=容量×速率）| 数值 | 0（只读）
+weight = auto               # 分配权重：auto（=容量MB×速率）| 数值 | 0（只读）
 ```
 
 - 文件夹下无 `diskinfo.ini` → 跳过，磁盘不可用
@@ -114,7 +167,7 @@ weight = auto               # 分配权重：auto（=容量×速率）| 数值 |
 启动时扫描 `blocks_dir` 下所有子文件夹，识别有效磁盘。写入时按权重分配：
 
 ```
-权重 = (weight==auto) ? capacity * speed_rating : weight
+权重 = (weight==auto) ? (capacity / 1MB) * speed_rating : weight
 选中概率 P_i = W_i / ΣW_j
 ```
 
@@ -420,7 +473,7 @@ curl -X DELETE "http://localhost:8080/api/objects?path=/photo/sunset.jpg"
 
 ```
 enostorg/
-├── enostorg.exe
+├── enostorg             ← 可执行文件（Windows 下为 enostorg.exe）
 ├── config.ini
 ├── storage.db           ← SQLite: files + blocks 表
 └── blocks/              ← [storage].blocks_dir
