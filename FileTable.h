@@ -68,6 +68,7 @@ public:
     FileTable& operator=(FileTable&& other) noexcept;
 
     void setBusyTimeout(int ms);
+    void setWalMode(bool enabled);
     void setDataDir(const std::string& dir) { dataDir_ = dir; }
 
     // ---- 元数据接口 ----
@@ -163,6 +164,10 @@ private:
     std::string resolveBlockPath(const std::string& blockPath) const;
     std::string generateBlockPath(const std::string& diskName) const;
     int diskIndexFromPath(const std::string& blockPath) const;
+    // 主块读取失败时沿 spare_block 环查找可读副本
+    std::vector<uint8_t> readBlockWithFallback(int64_t blockId) const;
+    // 返回主块 spare_block 环上的所有副本 id（不含主块自身）
+    std::vector<int64_t> replicaIdsOf(int64_t mainBlockId) const;
     void deleteBlockRing(int64_t blockId);
     void deleteAllBlocks(int64_t startBlockId);
 

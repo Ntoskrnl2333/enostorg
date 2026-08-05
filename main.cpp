@@ -88,11 +88,14 @@ int main()
 
     std::string dbPath      = cfg.get("database.path", "storage.db");
     int busyTimeout         = cfg.getInt("database.busy_timeout_ms", 5000);
+    bool walMode            = cfg.getBool("database.wal_mode", true);
     std::string logLevel    = cfg.get("logging.level", "info");
     std::string logFile     = cfg.get("logging.file", "");
     bool logConsole         = cfg.getBool("logging.console", true);
     std::string listenAddr  = cfg.get("server.listen", "0.0.0.0");
     int listenPort          = cfg.getInt("server.port", 8080);
+    int maxConnections      = cfg.getInt("server.max_connections", 0);
+    int requestTimeout      = cfg.getInt("server.request_timeout", 30);
     std::string blocksDir   = cfg.get("storage.blocks_dir", "blocks");
 
     // ---- 日志初始化（必须在任何日志输出前） ----
@@ -129,6 +132,7 @@ int main()
 
     auto ft = std::make_shared<FileTable>(dbPath);
     ft->setBusyTimeout(busyTimeout);
+    ft->setWalMode(walMode);
     ft->setDataDir(blocksDir);
 
     // 分块配置
@@ -434,6 +438,12 @@ int main()
 
             cb(err(405, "method not allowed"));
         });
+
+    // ---- 服务器级配置 ----
+    if (maxConnections > 0)
+        app().setMaxConnectionNum(static_cast<size_t>(maxConnections));
+    if (requestTimeout > 0)
+        app().setIdleConnectionTimeout(static_cast<size_t>(requestTimeout));
 
     LOG_INFO << "Server ready on " << listenAddr << ":" << listenPort;
     app().addListener(listenAddr, listenPort);

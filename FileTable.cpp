@@ -69,6 +69,12 @@ void FileTable::setBusyTimeout(int ms) {
     if (db_) sqlite3_busy_timeout(db_, ms);
 }
 
+void FileTable::setWalMode(bool enabled) {
+    if (!db_ || !enabled) return;
+    execute("PRAGMA journal_mode=WAL;");
+    LOG_INFO << "SQLite WAL mode enabled";
+}
+
 // ============================================================================
 // Schema
 // ============================================================================
@@ -433,6 +439,51 @@ bool FileTable::deleteBlockFile(const std::string& blockPath) const {
     return fs::remove(full, ec);
 }
 
+std::vector<uint8_t> FileTable::readBlockWithFallback(int64_t blockId) const {
+    auto block = getBlock(blockId);
+    if (!block) return {};
+
+    auto data = readBlockFile(block->blockPath);
+    if (!data.empty()) return data;
+
+    // 主块不可读，沿 spare_block 环查找可用副本
+    int64_t spareId = block->spareBlockId;
+    while (spareId >= 0 && spareId != blockId) {
+        auto rep = getBlock(spareId);
+        if (!rep) break;
+        data = readBlockFile(rep->blockPath);
+        if (!data.empty()) {
+            LOG_WARN << "readBlockWithFallback block=" << blockId
+                     << " fell back to replica=" << spareId
+                     << " path=" << rep->blockPath;
+            return data;
+        }
+        int64_t nextSpare = rep->spareBlockId;
+        if (nextSpare == blockId || nextSpare < 0) break;
+        spareId = nextSpare;
+    }
+
+    LOG_WARN << "readBlockWithFallback block=" << blockId
+             << " unreadable (main + all replicas)";
+    return {};
+}
+
+std::vector<int64_t> FileTable::replicaIdsOf(int64_t mainBlockId) const {
+    std::vector<int64_t> ids;
+    auto main = getBlock(mainBlockId);
+    if (!main) return ids;
+    int64_t spareId = main->spareBlockId;
+    while (spareId >= 0 && spareId != mainBlockId) {
+        auto rep = getBlock(spareId);
+        if (!rep) break;
+        ids.push_back(spareId);
+        int64_t nextSpare = rep->spareBlockId;
+        if (nextSpare == mainBlockId || nextSpare < 0) break;
+        spareId = nextSpare;
+    }
+    return ids;
+}
+
 void FileTable::deleteAllBlocks(int64_t startBlockId) {
     int64_t cur = startBlockId;
     while (cur >= 0) {
@@ -448,7 +499,7 @@ std::vector<uint8_t> FileTable::readBlocksData(const std::string& filePath) cons
     auto blocks = getFileBlocks(filePath);
     std::vector<uint8_t> result;
     for (auto& b : blocks) {
-        auto data = readBlockFile(b.blockPath);
+        auto data = readBlockWithFallback(b.id);
         result.insert(result.end(), data.begin(), data.end());
     }
     return result;
@@ -748,7 +799,7 @@ std::optional<FileTable::RangeResult> FileTable::getObjectDataRange(
         uint64_t bEnd = cumOff + bsz - 1;
 
         if (bEnd >= start && bStart <= end) {
-            auto filedata = readBlockFile(block->blockPath);
+            auto filedata = readBlockWithFallback(block->id);
             uint64_t copyStart = (std::max)(start, bStart) - bStart;
             uint64_t copyEnd   = (std::min)(end, bEnd) - bStart;
             uint64_t copyLen   = copyEnd - copyStart + 1;
@@ -839,17 +890,14 @@ std::optional<FileEntry> FileTable::appendObjectData(const std::string& filePath
             if (prevMainId >= 0) {
                 auto prevBlk = getBlock(prevMainId);
                 if (prevBlk) { prevBlk->nextBlockId = mid; updateBlock(*prevBlk); }
+                // 副本 next_block 与主块保持一致（不变量：副本 next_block 同主块）
+                for (auto rid : replicaIdsOf(prevMainId)) {
+                    auto rep = getBlock(rid);
+                    if (rep) { rep->nextBlockId = mid; updateBlock(*rep); }
+                }
             } else {
                 file->startBlockId = mid;
             }
-
-            // Replicas also point next_block to mid (same as main's next is unset yet)
-            // Actually replicas next_block should point to the NEXT main block
-            // Since this is the last chunk, next is -1
-            for (auto& rep : getFileBlocks(filePath)) {
-                // Hmm, this won't work. We need to track the alloc differently.
-            }
-            // For append, replicas next_block = -1 (tail)
             prevMainId = mid;
         } else {
             std::string path = generateBlockPath("default");
