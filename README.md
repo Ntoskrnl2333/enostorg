@@ -106,6 +106,8 @@ cmake --build build
 
 程序默认监听 `http://0.0.0.0:8080`。`config.ini`、`storage.db` 与 `blocks/` 均相对于**工作目录**（启动程序时所在目录）解析，请从想要存放数据的位置启动程序。
 
+> 注意：监听地址与鉴权联动——在 `config.ini` 的 `[tokens]` 段**配置了 token** 时按 `[server] listen` 监听（如 `0.0.0.0`）；**未配置任何 token** 时强制只监听 `127.0.0.1`，详见[认证](#认证)。
+
 > 提示：若 `blocks/` 下没有任何带 `diskinfo.ini` 的磁盘目录，且 `[backup] strategy=mirror`，写入对象会因可用磁盘不足而中止——请先按 [diskinfo.ini（磁盘元数据）](#diskinfoini磁盘元数据) 一节创建至少一块磁盘。
 
 ---
@@ -145,6 +147,13 @@ rolling_hash_mask_bits = 12 # 掩码位数（约每 2^bits 字节一个边界）
 [backup]
 strategy = mirror            # 备份策略：none（不备份）| mirror（副本环）
 replicas = 1                 # 每个主块的副本数（需 ≥ replicas+1 个可用磁盘）
+
+[tokens]
+# 鉴权 token：key = token 值，value = 权限（read | readwrite）
+# 未配置任何 token 时：鉴权关闭，服务器仅监听 127.0.0.1
+# 配置 token 后：所有 /api/* 请求需携带 Authorization: Bearer <token>
+# readonly-token = read
+# readwrite-token = readwrite
 ```
 
 ### diskinfo.ini（磁盘元数据）
@@ -288,17 +297,19 @@ flowchart TB
 
 ## API 参考
 
+> 以下示例默认已按[认证](#认证)配置 token，请求均携带 `Authorization: Bearer <token>`；未配置 token 时可省略该请求头。
+
 ### /api/files — 文件元数据
 
 **GET** `/api/files` — 列出所有文件
 ```
-curl http://localhost:8080/api/files
+curl -H "Authorization: Bearer <token>" http://localhost:8080/api/files
 ```
 响应：`[{file_entry}, ...]`
 
 **GET** `/api/files?path=...` — 获取单个文件元数据
 ```
-curl http://localhost:8080/api/files?path=/test/hello.txt
+curl -H "Authorization: Bearer <token>" http://localhost:8080/api/files?path=/test/hello.txt
 ```
 响应：`{file_entry}`
 
@@ -341,7 +352,7 @@ curl http://localhost:8080/api/files?path=/test/hello.txt
 #### POST — 创建对象
 
 ```
-curl -X POST "http://localhost:8080/api/objects?path=/test/hello.txt" \
+curl -X POST -H "Authorization: Bearer <token>" "http://localhost:8080/api/objects?path=/test/hello.txt" \
   --data-binary "Hello, world!"
 ```
 
@@ -351,7 +362,7 @@ curl -X POST "http://localhost:8080/api/objects?path=/test/hello.txt" \
 #### GET — 读取对象
 
 ```
-curl "http://localhost:8080/api/objects?path=/test/hello.txt"
+curl -H "Authorization: Bearer <token>" "http://localhost:8080/api/objects?path=/test/hello.txt"
 ```
 
 - 响应：`200 OK`，body 为原始二进制数据
@@ -360,7 +371,7 @@ curl "http://localhost:8080/api/objects?path=/test/hello.txt"
 #### GET + Range — 部分读取
 
 ```
-curl -H "Range: bytes=0-6" "http://localhost:8080/api/objects?path=/test/hello.txt"
+curl -H "Authorization: Bearer <token>" -H "Range: bytes=0-6" "http://localhost:8080/api/objects?path=/test/hello.txt"
 ```
 
 - 响应：`206 Partial Content`，带 `Content-Range: bytes 0-6/24` 头
@@ -369,7 +380,7 @@ curl -H "Range: bytes=0-6" "http://localhost:8080/api/objects?path=/test/hello.t
 #### PATCH — 追加数据（无 offset）
 
 ```
-curl -X PATCH "http://localhost:8080/api/objects?path=/test/hello.txt" \
+curl -X PATCH -H "Authorization: Bearer <token>" "http://localhost:8080/api/objects?path=/test/hello.txt" \
   --data-binary " appended!"
 ```
 
@@ -378,7 +389,7 @@ curl -X PATCH "http://localhost:8080/api/objects?path=/test/hello.txt" \
 #### PATCH + offset — 指定偏移修改
 
 ```
-curl -X PATCH "http://localhost:8080/api/objects?path=/test/hello.txt&offset=7" \
+curl -X PATCH -H "Authorization: Bearer <token>" "http://localhost:8080/api/objects?path=/test/hello.txt&offset=7" \
   --data-binary "World"
 ```
 
@@ -388,7 +399,7 @@ curl -X PATCH "http://localhost:8080/api/objects?path=/test/hello.txt&offset=7" 
 #### PUT — 重命名
 
 ```
-curl -X PUT "http://localhost:8080/api/objects?path=/test/hello.txt" \
+curl -X PUT -H "Authorization: Bearer <token>" "http://localhost:8080/api/objects?path=/test/hello.txt" \
   -H "Content-Type: application/json" \
   -d '{"new_path":"/test/renamed.txt"}'
 ```
@@ -398,7 +409,7 @@ curl -X PUT "http://localhost:8080/api/objects?path=/test/hello.txt" \
 #### DELETE — 删除对象
 
 ```
-curl -X DELETE "http://localhost:8080/api/objects?path=/test/hello.txt"
+curl -X DELETE -H "Authorization: Bearer <token>" "http://localhost:8080/api/objects?path=/test/hello.txt"
 ```
 
 - 响应：`200 OK`
@@ -467,30 +478,30 @@ hash = (hash - oldest_byte * BASE^(w-1)) * BASE + new_byte
 
 ```bash
 # 1. 创建一个文件对象（写入 24 字节 + 自动分块）
-curl -X POST "http://localhost:8080/api/objects?path=/photo/beach.jpg" \
+curl -X POST -H "Authorization: Bearer <token>" "http://localhost:8080/api/objects?path=/photo/beach.jpg" \
   --data-binary @beach.jpg
 
 # 2. 查看元数据
-curl "http://localhost:8080/api/files?path=/photo/beach.jpg"
+curl -H "Authorization: Bearer <token>" "http://localhost:8080/api/files?path=/photo/beach.jpg"
 
 # 3. 查看分块情况
-curl "http://localhost:8080/api/files/blocks?path=/photo/beach.jpg"
+curl -H "Authorization: Bearer <token>" "http://localhost:8080/api/files/blocks?path=/photo/beach.jpg"
 
 # 4. 读取前 1KB
-curl -H "Range: bytes=0-1023" "http://localhost:8080/api/objects?path=/photo/beach.jpg" \
+curl -H "Authorization: Bearer <token>" -H "Range: bytes=0-1023" "http://localhost:8080/api/objects?path=/photo/beach.jpg" \
   -o first_kb.bin
 
 # 5. 追加数据
-curl -X PATCH "http://localhost:8080/api/objects?path=/photo/beach.jpg" \
+curl -X PATCH -H "Authorization: Bearer <token>" "http://localhost:8080/api/objects?path=/photo/beach.jpg" \
   --data-binary @metadata.bin
 
 # 6. 重命名
-curl -X PUT "http://localhost:8080/api/objects?path=/photo/beach.jpg" \
+curl -X PUT -H "Authorization: Bearer <token>" "http://localhost:8080/api/objects?path=/photo/beach.jpg" \
   -H "Content-Type: application/json" \
   -d '{"new_path":"/photo/sunset.jpg"}'
 
 # 7. 删除
-curl -X DELETE "http://localhost:8080/api/objects?path=/photo/sunset.jpg"
+curl -X DELETE -H "Authorization: Bearer <token>" "http://localhost:8080/api/objects?path=/photo/sunset.jpg"
 ```
 
 ### 磁盘布局示例
