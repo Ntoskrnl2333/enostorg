@@ -69,6 +69,18 @@ public:
         return v == "true" || v == "1" || v == "yes" || v == "on";
     }
 
+    // 返回指定段内的全部 key->value（key 已去除 section 前缀）
+    std::unordered_map<std::string, std::string>
+    getSection(const std::string& section) const {
+        std::unordered_map<std::string, std::string> result;
+        std::string prefix = section + ".";
+        for (const auto& [fullKey, value] : data_) {
+            if (fullKey.compare(0, prefix.size(), prefix) == 0)
+                result[fullKey.substr(prefix.size())] = value;
+        }
+        return result;
+    }
+
 private:
     std::unordered_map<std::string, std::string> data_;
 

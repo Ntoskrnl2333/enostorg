@@ -8,6 +8,7 @@
 
 - [构建](#构建)
 - [配置](#配置)
+- [认证](#认证)
 - [架构](#架构)
 - [API 参考](#api-参考)
   - [/api/files — 文件元数据](#apifiles--文件元数据)
@@ -177,6 +178,29 @@ weight = auto               # 分配权重：auto（=容量MB×速率）| 数值
 | disk01 | 1GB | 8 | 8,192 | 11.5% |
 | disk02 | 10GB | 3 | 30,720 | 43.2% |
 | disk03 | 5GB | 6 | 30,720 | 43.2% |
+
+---
+
+## 认证
+
+服务器支持基于 Bearer Token 的鉴权，token 在 `config.ini` 的 `[tokens]` 段中配置：
+
+```ini
+[tokens]
+# key = token 值，value = 权限（read | readwrite）
+my-read-token  = read
+my-write-token = readwrite
+```
+
+- **权限语义**：`read` 仅允许 GET/HEAD 请求；`readwrite` 允许全部方法（GET/POST/PUT/PATCH/DELETE）。
+- **请求方式**：所有受保护接口必须携带请求头 `Authorization: Bearer <token>`，例如：
+  ```bash
+  curl -H "Authorization: Bearer my-write-token" http://127.0.0.1:8080/api/files
+  ```
+- **响应**：缺少或无效 token 返回 `401 {"error":"unauthorized"}`（并带 `WWW-Authenticate: Bearer` 头）；token 有效但权限不足返回 `403 {"error":"forbidden"}`。
+- **未配置任何 token**：鉴权自动关闭，且服务器**强制只监听 `127.0.0.1`**（忽略 `[server] listen` 配置），避免数据意外暴露到外网；启动日志会打印警告。
+- **配置了 token**：按 `[server] listen` 监听（如 `0.0.0.0`），所有 `/api/*` 请求都必须通过鉴权；根路径 `/`（Web UI）保持开放，页面顶部可输入 token（保存在浏览器 localStorage）。
+- **注意事项**：token 值不能包含 `=` 字符（INI 解析以第一个 `=` 为分隔），建议用 `openssl rand -hex 32` 生成；token 在内存中以 SHA-256 哈希形式存储并做常量时间比较，不会明文驻留。
 
 ---
 

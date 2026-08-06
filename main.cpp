@@ -1,6 +1,7 @@
 #include "FileTable.h"
 #include "DiskManager.h"
 #include "Config.h"
+#include "sha256.h"
 #include <drogon/drogon.h>
 #include <trantor/utils/AsyncFileLogger.h>
 #include <json/value.h>
@@ -8,6 +9,8 @@
 #include <sstream>
 #include <regex>
 #include <filesystem>
+#include <algorithm>
+#include <cctype>
 
 namespace fs = std::filesystem;
 
@@ -173,6 +176,83 @@ int main()
         }
     } else if (!logConsole) {
         trantor::Logger::setOutputFunction([](const char*, uint64_t){}, [](){});
+    }
+
+    // ---- 鉴权配置 ----
+    // token 预哈希后存储：请求时对传入 token 做同样哈希再查表，
+    // 固定 32 字节十六进制比较，避免时序侧信道泄漏 token 长度/内容
+    std::unordered_map<std::string, bool> tokenPerms;
+    for (const auto& [token, perm] : cfg.getSection("tokens")) {
+        std::string p = perm;
+        std::transform(p.begin(), p.end(), p.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        bool write;
+        if (p == "read")        write = false;
+        else if (p == "readwrite") write = true;
+        else {
+            LOG_WARN << "tokens." << token
+                     << ": unknown permission '" << perm
+                     << "' (expected read|readwrite), skipped";
+            continue;
+        }
+        tokenPerms[SHA256::hash(
+            reinterpret_cast<const uint8_t*>(token.data()), token.size())] = write;
+    }
+
+    if (tokenPerms.empty()) {
+        // 未配置任何 token：不启用鉴权，但只监听本机，避免误暴露到外网
+        listenAddr = "127.0.0.1";
+        LOG_WARN << "No tokens configured; authentication disabled, "
+                    "listening on 127.0.0.1 only";
+    } else {
+        LOG_INFO << "Authentication enabled with " << tokenPerms.size()
+                 << " token(s)";
+        app().registerPostRoutingAdvice(
+            [tokenPerms = std::move(tokenPerms)](
+                const HttpRequestPtr& req,
+                AdviceCallback&& fcb,
+                AdviceChainCallback&& fccb) {
+                const std::string& path = req->path();
+                if (path.rfind("/api/", 0) != 0) { fccb(); return; }
+
+                // 解析 Authorization: Bearer <token>（scheme 大小写不敏感）
+                std::string token;
+                const std::string& hdr = req->getHeader("Authorization");
+                if (!hdr.empty()) {
+                    size_t sp = hdr.find(' ');
+                    if (sp != std::string::npos) {
+                        std::string scheme = hdr.substr(0, sp);
+                        std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                                       [](unsigned char c) { return std::tolower(c); });
+                        if (scheme == "bearer") {
+                            std::string t = hdr.substr(sp + 1);
+                            size_t b = t.find_first_not_of(" \t");
+                            size_t e = t.find_last_not_of(" \t");
+                            if (b != std::string::npos)
+                                token = t.substr(b, e - b + 1);
+                        }
+                    }
+                }
+
+                auto reject = [&](int code, const std::string& msg) {
+                    auto r = err(code, msg);
+                    if (code == 401) r->addHeader("WWW-Authenticate", "Bearer");
+                    fcb(r);
+                };
+
+                if (token.empty()) { reject(401, "unauthorized"); return; }
+
+                auto it = tokenPerms.find(SHA256::hash(
+                    reinterpret_cast<const uint8_t*>(token.data()),
+                    token.size()));
+                if (it == tokenPerms.end()) { reject(401, "unauthorized"); return; }
+
+                // 读权限: GET/HEAD；写权限: 其余所有方法
+                bool isWrite = req->getMethod() != Get && req->getMethod() != Head;
+                if (isWrite && !it->second) { reject(403, "forbidden"); return; }
+
+                fccb();
+            });
     }
 
     auto ft = std::make_shared<FileTable>(dbPath);
