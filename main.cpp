@@ -69,9 +69,54 @@ bool parseRange(const std::string& rangeHeader, uint64_t& start, uint64_t& end,
     std::regex re(R"(bytes\s*=\s*(\d+)\s*-\s*(\d*))", std::regex::icase);
     std::smatch m;
     if (!std::regex_search(rangeHeader, m, re)) return false;
-    start = std::stoull(m[1].str());
-    hasEnd = m[2].matched;
-    if (hasEnd) end = std::stoull(m[2].str());
+    try {
+        start = std::stoull(m[1].str());
+        hasEnd = m[2].matched && !m[2].str().empty();
+        if (hasEnd) end = std::stoull(m[2].str());
+    } catch (...) { return false; }
+    return true;
+}
+
+// 严格解析非负整数：整串必须全部为数字，拒绝 stoll/stoull 抛异常或部分解析
+bool parseInt64(const std::string& s, int64_t& out) {
+    if (s.empty()) return false;
+    try {
+        size_t pos = 0;
+        out = std::stoll(s, &pos);
+        return pos == s.size();
+    } catch (...) { return false; }
+}
+
+bool parseUint64(const std::string& s, uint64_t& out) {
+    if (s.empty()) return false;
+    try {
+        size_t pos = 0;
+        out = std::stoull(s, &pos);
+        return pos == s.size();
+    } catch (...) { return false; }
+}
+
+std::vector<uint8_t> bodyBytes(const HttpRequestPtr& req) {
+    const char* bd = req->bodyData();
+    size_t len = req->bodyLength();
+    if (!bd || len == 0) return {};
+    return std::vector<uint8_t>(bd, bd + len);
+}
+
+std::string bodyString(const HttpRequestPtr& req) {
+    const char* bd = req->bodyData();
+    size_t len = req->bodyLength();
+    if (!bd || len == 0) return "";
+    return std::string(bd, len);
+}
+
+// 块路径必须为相对路径且不含 .. 组件（绝对路径与越界由 resolveBlockPath 兜底拒绝）
+bool isValidBlockPath(const std::string& p) {
+    if (p.empty()) return false;
+    if (fs::path(p).is_absolute()) return false;
+    for (const auto& part : fs::path(p)) {
+        if (part == "..") return false;
+    }
     return true;
 }
 
@@ -192,11 +237,13 @@ int main()
                 Json::Value body;
                 Json::CharReaderBuilder b;
                 std::string errs;
-                std::istringstream s(std::string(req->bodyData(), req->bodyLength()));
+                std::istringstream s(bodyString(req));
                 if (!Json::parseFromStream(b, s, &body, &errs)) { cb(err(400, "bad json")); return; }
                 FileEntry f;
                 f.filePath     = body.get("file_path","").asString();
-                f.size         = body.get("size", Json::Value(0)).asInt64();
+                int64_t sz     = body.get("size", Json::Value(0)).asInt64();
+                if (sz < 0) { cb(err(400, "size must be non-negative")); return; }
+                f.size         = static_cast<uint64_t>(sz);
                 f.description  = body.get("description","").asString();
                 f.createTime   = body.get("create_time", Json::Value(0)).asInt64();
                 f.modifyTime   = body.get("modify_time", Json::Value(0)).asInt64();
@@ -216,9 +263,13 @@ int main()
                 Json::Value body;
                 Json::CharReaderBuilder b;
                 std::string errs;
-                std::istringstream s(std::string(req->bodyData(), req->bodyLength()));
+                std::istringstream s(bodyString(req));
                 if (!Json::parseFromStream(b, s, &body, &errs)) { cb(err(400, "bad json")); return; }
-                if (body.isMember("size"))          f->size           = body["size"].asInt64();
+                if (body.isMember("size")) {
+                    int64_t sz = body["size"].asInt64();
+                    if (sz < 0) { cb(err(400, "size must be non-negative")); return; }
+                    f->size = static_cast<uint64_t>(sz);
+                }
                 if (body.isMember("description"))   f->description    = body["description"].asString();
                 if (body.isMember("create_time"))   f->createTime     = body["create_time"].asInt64();
                 if (body.isMember("modify_time"))   f->modifyTime     = body["modify_time"].asInt64();
@@ -256,7 +307,8 @@ int main()
             auto qpath  = getQueryParam(req, "path");
             auto qblock = getQueryParam(req, "block");
             if (qpath.empty() || qblock.empty()) { cb(err(400, "?path and ?block required")); return; }
-            int64_t bid = std::stoll(qblock);
+            int64_t bid;
+            if (!parseInt64(qblock, bid)) { cb(err(400, "invalid block id")); return; }
             if (!ft->appendBlockToFile(qpath, bid)) { cb(err(404, "file or block not found")); return; }
             cb(ok());
         }, {Post});
@@ -268,15 +320,18 @@ int main()
             Json::Value body;
             Json::CharReaderBuilder b;
             std::string errs;
-            std::istringstream s(std::string(req->bodyData(), req->bodyLength()));
+            std::istringstream s(bodyString(req));
             if (!Json::parseFromStream(b, s, &body, &errs)) { cb(err(400, "bad json")); return; }
             BlockEntry bk;
             bk.blockPath   = body.get("block_path","").asString();
             bk.sha256      = body.get("sha256","").asString();
-            bk.blockSize   = body.get("block_size", Json::Value(0)).asInt64();
+            int64_t bsz    = body.get("block_size", Json::Value(0)).asInt64();
             bk.isBadBlock  = body.get("is_bad", false).asBool();
             bk.nextBlockId = -1; bk.spareBlockId = -1;
             if (bk.blockPath.empty() || bk.sha256.empty()) { cb(err(400, "block_path, sha256, block_size required")); return; }
+            if (bsz < 0) { cb(err(400, "block_size must be non-negative")); return; }
+            if (!isValidBlockPath(bk.blockPath)) { cb(err(400, "invalid block_path")); return; }
+            bk.blockSize   = static_cast<uint64_t>(bsz);
             int64_t id = ft->insertBlock(bk);
             if (id < 0) { cb(err(500, "insert failed")); return; }
             bk.id = id;
@@ -290,17 +345,26 @@ int main()
              std::function<void(const HttpResponsePtr&)>&& cb) {
             auto qblock = getQueryParam(req, "block");
             if (qblock.empty()) { cb(err(400, "?block required")); return; }
-            int64_t id = std::stoll(qblock);
+            int64_t id;
+            if (!parseInt64(qblock, id)) { cb(err(400, "invalid block id")); return; }
             auto bk = ft->getBlock(id);
             if (!bk) { cb(err(404, "not found")); return; }
             Json::Value body;
             Json::CharReaderBuilder b;
             std::string errs;
-            std::istringstream s(std::string(req->bodyData(), req->bodyLength()));
+            std::istringstream s(bodyString(req));
             if (!Json::parseFromStream(b, s, &body, &errs)) { cb(err(400, "bad json")); return; }
-            if (body.isMember("block_path"))  bk->blockPath  = body["block_path"].asString();
+            if (body.isMember("block_path")) {
+                std::string bp = body["block_path"].asString();
+                if (!isValidBlockPath(bp)) { cb(err(400, "invalid block_path")); return; }
+                bk->blockPath = bp;
+            }
             if (body.isMember("sha256"))      bk->sha256     = body["sha256"].asString();
-            if (body.isMember("block_size"))  bk->blockSize  = body["block_size"].asInt64();
+            if (body.isMember("block_size")) {
+                int64_t bsz = body["block_size"].asInt64();
+                if (bsz < 0) { cb(err(400, "block_size must be non-negative")); return; }
+                bk->blockSize = static_cast<uint64_t>(bsz);
+            }
             if (body.isMember("is_bad"))      bk->isBadBlock = body["is_bad"].asBool();
             if (body.isMember("next_block"))  bk->nextBlockId = body["next_block"].asInt64();
             if (body.isMember("spare_block")) bk->spareBlockId = body["spare_block"].asInt64();
@@ -314,7 +378,8 @@ int main()
              std::function<void(const HttpResponsePtr&)>&& cb) {
             auto qblock = getQueryParam(req, "block");
             if (qblock.empty()) { cb(err(400, "?block required")); return; }
-            int64_t id = std::stoll(qblock);
+            int64_t id;
+            if (!parseInt64(qblock, id)) { cb(err(400, "invalid block id")); return; }
             if (!ft->deleteBlock(id)) { cb(err(404, "not found")); return; }
             cb(ok());
         }, {Delete});
@@ -325,7 +390,8 @@ int main()
              std::function<void(const HttpResponsePtr&)>&& cb) {
             auto qblock = getQueryParam(req, "block");
             if (qblock.empty()) { cb(err(400, "?block required")); return; }
-            int64_t id = std::stoll(qblock);
+            int64_t id;
+            if (!parseInt64(qblock, id)) { cb(err(400, "invalid block id")); return; }
             if (!ft->markBadBlock(id)) { cb(err(404, "not found")); return; }
             cb(ok());
         }, {Patch});
@@ -337,8 +403,8 @@ int main()
             auto qblock = getQueryParam(req, "block");
             auto qspare = getQueryParam(req, "spare");
             if (qblock.empty() || qspare.empty()) { cb(err(400, "?block and ?spare required")); return; }
-            int64_t id = std::stoll(qblock);
-            int64_t spare = std::stoll(qspare);
+            int64_t id, spare;
+            if (!parseInt64(qblock, id) || !parseInt64(qspare, spare)) { cb(err(400, "invalid block id")); return; }
             if (!ft->setSpareBlock(id, spare)) { cb(err(404, "not found")); return; }
             cb(ok());
         }, {Patch});
@@ -355,7 +421,7 @@ int main()
             // POST: 创建对象
             if (req->getMethod() == Post) {
                 if (qpath.empty()) { cb(err(400, "?path required")); return; }
-                std::vector<uint8_t> data(req->bodyData(), req->bodyData() + req->bodyLength());
+                auto data = bodyBytes(req);
                 auto result = ft->storeObject(qpath, data);
                 if (!result) { cb(err(409, "exists or insert failed")); return; }
                 auto r = HttpResponse::newHttpJsonResponse(fileToJson(*result));
@@ -374,7 +440,22 @@ int main()
                     uint64_t rs = 0, re = 0;
                     bool hasEnd = false;
                     if (!parseRange(rangeHdr, rs, re, hasEnd)) { cb(err(400, "invalid Range")); return; }
-                    if (!hasEnd) re = file->size > 0 ? file->size - 1 : 0;
+                    if (file->size == 0 || rs >= file->size) {
+                        auto r = HttpResponse::newHttpResponse();
+                        r->setStatusCode(k416RequestedRangeNotSatisfiable);
+                        r->addHeader("Content-Range", "bytes */" + std::to_string(file->size));
+                        cb(r); return;
+                    }
+                    if (!hasEnd || re >= file->size) re = file->size - 1;
+                    if (re < rs) {
+                        auto r = HttpResponse::newHttpResponse();
+                        r->setStatusCode(k416RequestedRangeNotSatisfiable);
+                        r->addHeader("Content-Range", "bytes */" + std::to_string(file->size));
+                        cb(r); return;
+                    }
+                    // 单次 Range 读取上限，防御超大请求导致的内存耗尽
+                    const uint64_t kMaxRangeLen = 1ull << 30;
+                    if (re - rs + 1 > kMaxRangeLen) re = rs + kMaxRangeLen - 1;
                     auto rr = ft->getObjectDataRange(qpath, rs, re);
                     if (!rr) { cb(err(500, "range read failed")); return; }
                     auto r = HttpResponse::newHttpResponse();
@@ -400,10 +481,11 @@ int main()
                 if (qpath.empty()) { cb(err(400, "?path required")); return; }
                 auto file = ft->getFile(qpath);
                 if (!file) { cb(err(404, "not found")); return; }
-                std::vector<uint8_t> data(req->bodyData(), req->bodyData() + req->bodyLength());
+                auto data = bodyBytes(req);
                 auto offStr = getQueryParam(req, "offset");
                 if (!offStr.empty()) {
-                    uint64_t off = std::stoull(offStr);
+                    uint64_t off;
+                    if (!parseUint64(offStr, off)) { cb(err(400, "invalid offset")); return; }
                     auto result = ft->patchObjectData(qpath, off, data);
                     if (!result) { cb(err(500, "patch failed")); return; }
                     cb(HttpResponse::newHttpJsonResponse(fileToJson(*result))); return;
@@ -419,7 +501,7 @@ int main()
                 Json::Value body;
                 Json::CharReaderBuilder b;
                 std::string errs;
-                std::istringstream s(std::string(req->bodyData(), req->bodyLength()));
+                std::istringstream s(bodyString(req));
                 if (!Json::parseFromStream(b, s, &body, &errs)) { cb(err(400, "bad json")); return; }
                 std::string newPath = body.get("new_path", "").asString();
                 if (newPath.empty()) { cb(err(400, "new_path required")); return; }

@@ -6,6 +6,7 @@
 #include <optional>
 #include <memory>
 #include <ctime>
+#include <atomic>
 
 struct sqlite3;
 struct sqlite3_stmt;
@@ -150,7 +151,7 @@ private:
     sqlite3* db_ = nullptr;
     ChunkConfig chunkCfg_;
     std::string dataDir_;
-    mutable int blockCounter_ = 0;
+    mutable std::atomic<int> blockCounter_{0};
     DiskManager* diskManager_ = nullptr;
     BackupConfig backupCfg_;
 

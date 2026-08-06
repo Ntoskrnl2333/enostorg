@@ -10,6 +10,9 @@
 #include <chrono>
 #include <fstream>
 #include <filesystem>
+#include <unordered_set>
+#include <limits>
+#include <random>
 #include <sys/stat.h>
 
 namespace fs = std::filesystem;
@@ -329,8 +332,9 @@ std::vector<BlockEntry> FileTable::getFileBlocks(const std::string& filePath) co
     std::vector<BlockEntry> blocks;
     auto file = getFile(filePath);
     if (!file || file->startBlockId < 0) return blocks;
+    std::unordered_set<int64_t> seen;
     int64_t cur = file->startBlockId;
-    while (cur >= 0) {
+    while (cur >= 0 && seen.insert(cur).second) {
         auto b = getBlock(cur);
         if (!b) break;
         blocks.push_back(*b);
@@ -359,8 +363,10 @@ bool FileTable::appendBlockToFile(const std::string& filePath, int64_t blockId) 
         file->startBlockId = blockId;
         return updateFile(*file);
     }
+    std::unordered_set<int64_t> seen;
     int64_t cur = file->startBlockId;
     while (true) {
+        if (!seen.insert(cur).second) return false; // 链存在环，拒绝追加
         auto b = getBlock(cur);
         if (!b) return false;
         if (b->nextBlockId < 0) {
@@ -399,8 +405,27 @@ void FileTable::rollbackTransaction() { execute("ROLLBACK"); }
 
 std::string FileTable::resolveBlockPath(const std::string& blockPath) const {
     if (blockPath.empty()) return "";
-    if (fs::path(blockPath).is_absolute()) return blockPath;
-    return (fs::path(dataDir_) / blockPath).string();
+    std::error_code ec;
+    fs::path base = fs::absolute(dataDir_, ec);
+    if (ec) return "";
+
+    fs::path full = fs::path(blockPath).is_absolute()
+                        ? fs::path(blockPath)
+                        : base / fs::path(blockPath);
+    full = fs::weakly_canonical(full, ec);
+    if (ec) return "";
+
+    fs::path baseNorm = fs::weakly_canonical(base, ec);
+    if (ec) return "";
+
+    std::string baseStr = baseNorm.string();
+    std::string fullStr = full.string();
+    // 拒绝指向数据目录本身或数据目录之外的路径（防路径穿越）
+    char sep = static_cast<char>(fs::path::preferred_separator);
+    if (fullStr == baseStr) return "";
+    if (fullStr.rfind(baseStr + sep, 0) != 0)
+        return "";
+    return fullStr;
 }
 
 std::string FileTable::generateBlockPath(const std::string& diskName) const {
@@ -408,24 +433,37 @@ std::string FileTable::generateBlockPath(const std::string& diskName) const {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   now.time_since_epoch()).count();
     int n = ++blockCounter_;
+    static uint64_t nonce = std::chrono::high_resolution_clock::now()
+                                .time_since_epoch().count() ^
+                            static_cast<uint64_t>(std::random_device{}());
+    ++nonce;
     std::ostringstream oss;
-    oss << diskName << "/block_" << ms << "_" << n << ".dat";
+    oss << diskName << "/block_" << ms << "_" << n << "_" << nonce << ".dat";
     return oss.str();
 }
 
 std::vector<uint8_t> FileTable::readBlockFile(const std::string& blockPath) const {
     std::string full = resolveBlockPath(blockPath);
+    if (full.empty()) return {};
     std::ifstream f(full, std::ios::binary | std::ios::ate);
     if (!f) return {};
-    size_t sz = static_cast<size_t>(f.tellg());
+    std::streampos end = f.tellg();
+    if (end < 0) return {};
+    uint64_t sz = static_cast<uint64_t>(end);
+    // 单块超过 1 GiB 视为异常（分块配置上限远小于此），防御恶意元数据导致的巨大分配
+    if (sz > (1ull << 30)) return {};
     f.seekg(0);
-    std::vector<uint8_t> buf(sz);
-    f.read(reinterpret_cast<char*>(buf.data()), sz);
+    std::vector<uint8_t> buf(static_cast<size_t>(sz));
+    if (sz > 0) {
+        f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(sz));
+        if (f.gcount() != static_cast<std::streamsize>(sz)) return {};
+    }
     return buf;
 }
 
 bool FileTable::writeBlockFile(const std::string& blockPath, const std::vector<uint8_t>& data) const {
     std::string full = resolveBlockPath(blockPath);
+    if (full.empty()) return false;
     fs::create_directories(fs::path(full).parent_path());
     std::ofstream f(full, std::ios::binary | std::ios::trunc);
     if (!f) return false;
@@ -435,6 +473,7 @@ bool FileTable::writeBlockFile(const std::string& blockPath, const std::vector<u
 
 bool FileTable::deleteBlockFile(const std::string& blockPath) const {
     std::string full = resolveBlockPath(blockPath);
+    if (full.empty()) return false;
     std::error_code ec;
     return fs::remove(full, ec);
 }
@@ -447,8 +486,9 @@ std::vector<uint8_t> FileTable::readBlockWithFallback(int64_t blockId) const {
     if (!data.empty()) return data;
 
     // 主块不可读，沿 spare_block 环查找可用副本
+    std::unordered_set<int64_t> seen;
     int64_t spareId = block->spareBlockId;
-    while (spareId >= 0 && spareId != blockId) {
+    while (spareId >= 0 && spareId != blockId && seen.insert(spareId).second) {
         auto rep = getBlock(spareId);
         if (!rep) break;
         data = readBlockFile(rep->blockPath);
@@ -472,8 +512,9 @@ std::vector<int64_t> FileTable::replicaIdsOf(int64_t mainBlockId) const {
     std::vector<int64_t> ids;
     auto main = getBlock(mainBlockId);
     if (!main) return ids;
+    std::unordered_set<int64_t> seen;
     int64_t spareId = main->spareBlockId;
-    while (spareId >= 0 && spareId != mainBlockId) {
+    while (spareId >= 0 && spareId != mainBlockId && seen.insert(spareId).second) {
         auto rep = getBlock(spareId);
         if (!rep) break;
         ids.push_back(spareId);
@@ -485,8 +526,9 @@ std::vector<int64_t> FileTable::replicaIdsOf(int64_t mainBlockId) const {
 }
 
 void FileTable::deleteAllBlocks(int64_t startBlockId) {
+    std::unordered_set<int64_t> seen;
     int64_t cur = startBlockId;
-    while (cur >= 0) {
+    while (cur >= 0 && seen.insert(cur).second) {
         auto b = getBlock(cur);
         if (!b) break;
         int64_t next = b->nextBlockId;
@@ -596,8 +638,9 @@ void FileTable::deleteBlockRing(int64_t blockId) {
     int replicaCount = 0;
 
     // Walk spare ring: delete all replica files + metadata
+    std::unordered_set<int64_t> seen;
     int64_t spareId = mainBlock->spareBlockId;
-    while (spareId >= 0 && spareId != blockId) {
+    while (spareId >= 0 && spareId != blockId && seen.insert(spareId).second) {
         auto rep = getBlock(spareId);
         if (!rep) break;
         int64_t nextSpare = rep->spareBlockId;
@@ -660,6 +703,14 @@ std::optional<FileEntry> FileTable::storeObject(const std::string& filePath,
 
     beginTransaction();
 
+    std::vector<std::string> written;  // 本次已写的块文件，失败时统一清理
+    auto fail = [&](const std::string& why) -> std::optional<FileEntry> {
+        for (const auto& p : written) deleteBlockFile(p);
+        rollbackTransaction();
+        LOG_ERROR << "storeObject path=" << filePath << " failed: " << why;
+        return std::nullopt;
+    };
+
     std::vector<int64_t> mainIds;
     std::vector<std::vector<int64_t>> repIds;
 
@@ -670,26 +721,22 @@ std::optional<FileEntry> FileTable::storeObject(const std::string& filePath,
         if (doBackup) {
             int need = 1 + repCount;
             auto disks = diskManager_->selectDisks(need, {});
-            if ((int)disks.size() < need) {
-                LOG_ERROR << "storeObject path=" << filePath << " chunk=" << ci
-                          << " failed: need " << need << " disks, got " << disks.size();
-                rollbackTransaction(); return std::nullopt;
-            }
+            if ((int)disks.size() < need)
+                return fail("need " + std::to_string(need) + " disks, got " +
+                            std::to_string(disks.size()));
 
             // Main block
             std::string mainPath = generateBlockPath(diskManager_->getDisk(disks[0]).name);
-            if (!writeBlockFile(mainPath, chunk)) {
-                LOG_ERROR << "storeObject path=" << filePath << " chunk=" << ci
-                          << " write main failed: " << mainPath;
-                rollbackTransaction(); return std::nullopt;
-            }
+            if (!writeBlockFile(mainPath, chunk))
+                return fail("write main failed: " + mainPath);
+            written.push_back(mainPath);
             diskManager_->trackAllocation(disks[0], chunk.size());
 
             BlockEntry mb;
             mb.blockPath = mainPath; mb.blockSize = chunk.size(); mb.sha256 = sha;
             mb.nextBlockId = -1; mb.spareBlockId = -1;
             int64_t mid = insertBlock(mb);
-            if (mid < 0) { rollbackTransaction(); return std::nullopt; }
+            if (mid < 0) return fail("insert main block failed");
             mainIds.push_back(mid);
 
             // Replicas
@@ -697,18 +744,16 @@ std::optional<FileEntry> FileTable::storeObject(const std::string& filePath,
             std::vector<int64_t> reps;
             for (int r = 0; r < repCount; r++) {
                 std::string rpath = generateBlockPath(diskManager_->getDisk(disks[1 + r]).name);
-                if (!writeBlockFile(rpath, chunk)) {
-                    LOG_ERROR << "storeObject path=" << filePath << " chunk=" << ci
-                              << " write replica[" << r << "] failed: " << rpath;
-                    rollbackTransaction(); return std::nullopt;
-                }
+                if (!writeBlockFile(rpath, chunk))
+                    return fail("write replica[" + std::to_string(r) + "] failed: " + rpath);
+                written.push_back(rpath);
                 diskManager_->trackAllocation(disks[1 + r], chunk.size());
 
                 BlockEntry rb;
                 rb.blockPath = rpath; rb.blockSize = chunk.size(); rb.sha256 = sha;
                 rb.nextBlockId = -1; rb.spareBlockId = -1;
                 int64_t rid = insertBlock(rb);
-                if (rid < 0) { rollbackTransaction(); return std::nullopt; }
+                if (rid < 0) return fail("insert replica block failed");
                 reps.push_back(rid);
 
                 auto prevBlk = getBlock(prevRingId);
@@ -724,13 +769,14 @@ std::optional<FileEntry> FileTable::storeObject(const std::string& filePath,
         } else {
             // No backup — single block
             std::string path = generateBlockPath("default");
-            if (!writeBlockFile(path, chunk)) { rollbackTransaction(); return std::nullopt; }
+            if (!writeBlockFile(path, chunk)) return fail("write failed: " + path);
+            written.push_back(path);
 
             BlockEntry b;
             b.blockPath = path; b.blockSize = chunk.size(); b.sha256 = sha;
             b.nextBlockId = -1; b.spareBlockId = -1;
             int64_t id = insertBlock(b);
-            if (id < 0) { rollbackTransaction(); return std::nullopt; }
+            if (id < 0) return fail("insert block failed");
             mainIds.push_back(id);
         }
     }
@@ -756,10 +802,8 @@ std::optional<FileEntry> FileTable::storeObject(const std::string& filePath,
     f.startBlockId = mainIds.empty() ? -1 : mainIds[0];
     f.accessActivity = 0.0;
 
-    if (!insertFile(f)) {
-        LOG_ERROR << "storeObject path=" << filePath << " insertFile failed, rolling back";
-        rollbackTransaction(); return std::nullopt;
-    }
+    if (!insertFile(f))
+        return fail("insertFile failed");
     commitTransaction();
     LOG_INFO << "storeObject path=" << filePath << " size=" << data.size()
              << " chunks=" << mainIds.size() << " startBlock=" << f.startBlockId;
@@ -785,12 +829,15 @@ std::optional<FileTable::RangeResult> FileTable::getObjectDataRange(
     if (start > end) start = end;
 
     uint64_t reqLen = end - start + 1;
+    // 防御：单次 Range 读取上限（与 main.cpp 中校验一致）
+    if (reqLen > (1ull << 30)) return std::nullopt;
     std::vector<uint8_t> result;
     result.reserve(static_cast<size_t>(reqLen));
     uint64_t cumOff = 0;
 
+    std::unordered_set<int64_t> seen;
     int64_t curId = file->startBlockId;
-    while (curId >= 0 && cumOff <= end) {
+    while (curId >= 0 && seen.insert(curId).second && cumOff <= end) {
         auto block = getBlock(curId);
         if (!block) break;
 
@@ -835,13 +882,23 @@ std::optional<FileEntry> FileTable::appendObjectData(const std::string& filePath
     bool doBackup = (diskManager_ && backupCfg_.strategy == "mirror" && repCount > 0);
     beginTransaction();
 
+    std::vector<std::string> written;  // 本次已写的块文件，失败时统一清理
+    auto fail = [&](const std::string& why) -> std::optional<FileEntry> {
+        for (const auto& p : written) deleteBlockFile(p);
+        rollbackTransaction();
+        LOG_ERROR << "appendObjectData path=" << filePath << " failed: " << why;
+        return std::nullopt;
+    };
+
     // Find tail
     int64_t tailId = -1;
     if (file->startBlockId >= 0) {
+        std::unordered_set<int64_t> seen;
         int64_t cur = file->startBlockId;
         while (true) {
+            if (!seen.insert(cur).second) return fail("block chain contains a cycle");
             auto b = getBlock(cur);
-            if (!b) { rollbackTransaction(); return std::nullopt; }
+            if (!b) return fail("block chain broken");
             if (b->nextBlockId < 0) { tailId = cur; break; }
             cur = b->nextBlockId;
         }
@@ -854,29 +911,31 @@ std::optional<FileEntry> FileTable::appendObjectData(const std::string& filePath
         if (doBackup) {
             int need = 1 + repCount;
             auto disks = diskManager_->selectDisks(need, {});
-            if ((int)disks.size() < need) { rollbackTransaction(); return std::nullopt; }
+            if ((int)disks.size() < need) return fail("insufficient disks");
 
             std::string mainPath = generateBlockPath(diskManager_->getDisk(disks[0]).name);
-            if (!writeBlockFile(mainPath, chunk)) { rollbackTransaction(); return std::nullopt; }
+            if (!writeBlockFile(mainPath, chunk)) return fail("write main failed: " + mainPath);
+            written.push_back(mainPath);
             diskManager_->trackAllocation(disks[0], chunk.size());
 
             BlockEntry mb;
             mb.blockPath = mainPath; mb.blockSize = chunk.size(); mb.sha256 = sha;
             mb.nextBlockId = -1; mb.spareBlockId = -1;
             int64_t mid = insertBlock(mb);
-            if (mid < 0) { rollbackTransaction(); return std::nullopt; }
+            if (mid < 0) return fail("insert main block failed");
 
             int64_t prevRingId = mid;
             for (int r = 0; r < repCount; r++) {
                 std::string rpath = generateBlockPath(diskManager_->getDisk(disks[1 + r]).name);
-                if (!writeBlockFile(rpath, chunk)) { rollbackTransaction(); return std::nullopt; }
+                if (!writeBlockFile(rpath, chunk)) return fail("write replica failed: " + rpath);
+                written.push_back(rpath);
                 diskManager_->trackAllocation(disks[1 + r], chunk.size());
 
                 BlockEntry rb;
                 rb.blockPath = rpath; rb.blockSize = chunk.size(); rb.sha256 = sha;
                 rb.nextBlockId = -1; rb.spareBlockId = -1;
                 int64_t rid = insertBlock(rb);
-                if (rid < 0) { rollbackTransaction(); return std::nullopt; }
+                if (rid < 0) return fail("insert replica block failed");
 
                 auto prevBlk = getBlock(prevRingId);
                 if (prevBlk) { prevBlk->spareBlockId = rid; updateBlock(*prevBlk); }
@@ -901,13 +960,14 @@ std::optional<FileEntry> FileTable::appendObjectData(const std::string& filePath
             prevMainId = mid;
         } else {
             std::string path = generateBlockPath("default");
-            if (!writeBlockFile(path, chunk)) { rollbackTransaction(); return std::nullopt; }
+            if (!writeBlockFile(path, chunk)) return fail("write failed: " + path);
+            written.push_back(path);
 
             BlockEntry b;
             b.blockPath = path; b.blockSize = chunk.size(); b.sha256 = sha;
             b.nextBlockId = -1; b.spareBlockId = -1;
             int64_t id = insertBlock(b);
-            if (id < 0) { rollbackTransaction(); return std::nullopt; }
+            if (id < 0) return fail("insert block failed");
 
             if (prevMainId >= 0) {
                 auto prevBlk = getBlock(prevMainId);
@@ -936,9 +996,13 @@ std::optional<FileEntry> FileTable::patchObjectData(const std::string& filePath,
     if (data.empty()) return file;
 
     auto fullData = readBlocksData(filePath);
-    if (fullData.size() < offset) return std::nullopt;
-    if (offset + data.size() > fullData.size())
-        fullData.resize(offset + data.size());
+    if (offset > fullData.size()) return std::nullopt;
+    if (data.size() > fullData.size() - offset) {
+        // 扩展文件：先验证 offset + data.size() 不会回绕（防堆越界写）
+        if (data.size() > std::numeric_limits<size_t>::max() - static_cast<size_t>(offset))
+            return std::nullopt;
+        fullData.resize(static_cast<size_t>(offset) + data.size());
+    }
     std::memcpy(fullData.data() + offset, data.data(), data.size());
 
     // Delete old blocks (including replica rings) and re-write

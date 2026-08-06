@@ -145,7 +145,7 @@
 " fetch(API+'/blocks/bad?block='+id,{method:'PATCH'}).then(loadBlocks);}\n"
 "function esc(s){\n"
 " var d=document.createElement('div');d.appendChild(document.createTextNode(s));\n"
-" return d.innerHTML;}\n"
+" return d.innerHTML.replace(/'/g,'&#39;');}\n"
 "function fmtSize(n){\n"
 " if(n>=1073741824)return(n/1073741824).toFixed(2)+' GB';\n"
 " if(n>=1048576)return(n/1048576).toFixed(2)+' MB';\n"

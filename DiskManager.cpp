@@ -42,7 +42,13 @@ bool DiskManager::discover(const std::string& disksDir) {
             // 自动 = 容量(MB) * 速率
             d.weight = (double)(d.capacity / 1048576) * d.speedRating;
         } else {
-            d.weight = std::stod(w);
+            try {
+                d.weight = std::stod(w);
+            } catch (...) {
+                LOG_WARN << "disk " << d.name << ": invalid weight \"" << w
+                         << "\", treating as read-only";
+                d.weight = 0;
+            }
         }
 
         d.available = static_cast<int64_t>(d.capacity);
